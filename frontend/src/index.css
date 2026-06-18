@@ -1,0 +1,161 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 12%;
+    --primary: 262 83% 58%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 14% 96%;
+    --secondary-foreground: 240 10% 12%;
+    --muted: 240 14% 96%;
+    --muted-foreground: 240 6% 44%;
+    --accent: 240 12% 94%;
+    --accent-foreground: 240 10% 12%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 240 13% 91%;
+    --input: 240 13% 88%;
+    --ring: 262 83% 60%;
+    --radius: 0.8rem;
+  }
+
+  /* 暗色主题：近纯黑中性面 + 发丝边框 + 单一克制紫强调色 */
+  .dark {
+    --background: 240 6% 3%;
+    --foreground: 0 0% 95%;
+    --card: 240 6% 6.5%;
+    --card-foreground: 0 0% 95%;
+    --primary: 263 78% 63%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 5% 14%;
+    --secondary-foreground: 0 0% 95%;
+    --muted: 240 6% 12%;
+    --muted-foreground: 240 5% 58%;
+    --accent: 240 6% 15%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 72% 55%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 6% 15%;
+    --input: 240 6% 18%;
+    --ring: 263 78% 63%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 全局背景：以黑为主，仅极淡的单点紫色辉光制造纵深 */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(50rem 40rem at 15% -12%, hsl(263 80% 52% / 0.10), transparent 60%),
+      radial-gradient(46rem 42rem at 100% 4%, hsl(240 30% 26% / 0.06), transparent 58%),
+      hsl(var(--background));
+  }
+
+  /* 细网格：中性、低对比，仅顶部渐隐显现 */
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background-image:
+      linear-gradient(hsl(0 0% 100% / 0.025) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(0 0% 100% / 0.025) 1px, transparent 1px);
+    background-size: 46px 46px;
+    mask-image: radial-gradient(ellipse 100% 80% at 50% 0%, black 30%, transparent 75%);
+  }
+
+  :root:not(.dark) body::before {
+    background:
+      radial-gradient(60rem 60rem at 12% -10%, hsl(262 90% 70% / 0.12), transparent 60%),
+      radial-gradient(50rem 50rem at 100% 0%, hsl(240 40% 70% / 0.08), transparent 55%),
+      hsl(var(--background));
+  }
+
+  :root:not(.dark) body::after {
+    background-image:
+      linear-gradient(hsl(var(--border) / 0.5) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--border) / 0.5) 1px, transparent 1px);
+  }
+
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full;
+    background: hsl(0 0% 100% / 0.12);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(0 0% 100% / 0.22);
+  }
+}
+
+@layer components {
+  /* 卡片：近黑实面 + 发丝高光，阴影中性（不再带紫） */
+  .glass {
+    @apply border border-white/[0.06] bg-card/70 backdrop-blur-xl;
+    box-shadow:
+      0 1px 0 0 hsl(0 0% 100% / 0.03) inset,
+      0 24px 50px -30px hsl(0 0% 0% / 0.85);
+  }
+
+  .glass-soft {
+    @apply border border-white/[0.06] bg-white/[0.02] backdrop-blur-md;
+  }
+
+  /* 渐变标题：暗色下近白、亮色下取品牌紫 */
+  .text-gradient {
+    @apply bg-gradient-to-r from-violet-600 to-fuchsia-500 bg-clip-text text-transparent;
+  }
+  .dark .text-gradient {
+    @apply from-white to-violet-200;
+  }
+
+  /* 主色辉光：克制的描边 + 浅晕 */
+  .glow-primary {
+    box-shadow:
+      0 0 0 1px hsl(var(--primary) / 0.3),
+      0 6px 24px -10px hsl(var(--primary) / 0.45);
+  }
+
+  /* 渐变描边容器：单色紫、低不透明，避免喧宾夺主 */
+  .ring-gradient {
+    position: relative;
+  }
+  .ring-gradient::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(120deg, hsl(263 80% 60% / 0.8), hsl(263 30% 40% / 0.15));
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0.5;
+    pointer-events: none;
+  }
+}
