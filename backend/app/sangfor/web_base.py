@@ -63,6 +63,11 @@ CONFIRMED_WRITES: set[tuple[str, str]] = {
     ("/cgi-bin/netpolicy.cgi", "add"),
     # 访问权限策略「删除」已据真实抓包确认：opr=delete，name 为名称数组（支持批量）。
     ("/cgi-bin/netpolicy.cgi", "delete"),
+    # 旧固件（acnetpolicy.cgi）策略写：「新建」已据南京 AC 真实抓包确认（结构同 netpolicy，
+    # 仅 ssl 段为完整默认结构，由 create_policy 自动补齐）；「编辑」走读—改—写、回填设备自身
+    # 完整对象仅替换规则，结构由设备保证一致，故一并放行。
+    ("/cgi-bin/acnetpolicy.cgi", "add"),
+    ("/cgi-bin/acnetpolicy.cgi", "modify"),
     # 自定义 URL 库「新增/编辑/删除」已据真实抓包确认。
     ("/cgi-bin/objurlgrp.cgi", "add"),
     ("/cgi-bin/objurlgrp.cgi", "modify"),
@@ -260,7 +265,12 @@ class SangforWebBase:
             if _retry and any(h in msg.lower() for h in self._AUTH_ERROR_HINTS):
                 self._logged_in = False
                 return self._post(path, payload, _retry=False)
-            raise SangforWebError(msg or "接口返回失败")
+            # 带上 path / opr 与设备原始响应，便于定位（设备常不给 msg）
+            opr = payload.get("opr", "")
+            if not msg:
+                snippet = json.dumps(result, ensure_ascii=False)[:300]
+                msg = f"设备未返回错误描述，响应：{snippet}"
+            raise SangforWebError(f"{path}（opr={opr}）返回失败：{msg}")
         return result
 
     def _write_cgi(self, path: str, payload: dict, *, dry_run: bool) -> dict:

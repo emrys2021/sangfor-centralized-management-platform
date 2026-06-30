@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { PageHeader, Spinner } from "@/components/common";
+import { useConfirm } from "@/components/confirm-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -58,6 +59,7 @@ function relativeTime(ts: number): string {
 
 export function InstancesPage() {
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const { data: instances = [], isLoading } = useQuery({
     queryKey: ["instances"],
     queryFn: () => instanceApi.list(),
@@ -264,8 +266,16 @@ export function InstancesPage() {
                     <Button
                       variant="ghost"
                       size="icon"
-                      onClick={() => {
-                        if (confirm(`确认删除实例「${inst.name}」？`)) remove.mutate(inst.id);
+                      onClick={async () => {
+                        if (
+                          await confirm({
+                            title: "删除实例",
+                            description: `确认删除实例「${inst.name}」？`,
+                            variant: "destructive",
+                            confirmText: "删除",
+                          })
+                        )
+                          remove.mutate(inst.id);
                       }}
                     >
                       <Trash2 className="h-4 w-4 text-destructive" />

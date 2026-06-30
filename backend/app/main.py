@@ -23,7 +23,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
 from app.db.init_db import init_db
-from app.routers import audit, customrules, instances, policies, sync, urls
+from app.routers import audit, customrules, instances, policies, search, sync, urls
 
 logger = logging.getLogger("app")
 
@@ -79,4 +79,5 @@ app.include_router(customrules.router)
 app.include_router(urls.router)
 app.include_router(policies.router)
 app.include_router(sync.router)
+app.include_router(search.router)
 app.include_router(audit.router)

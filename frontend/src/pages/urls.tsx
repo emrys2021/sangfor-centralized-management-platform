@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { CenteredSpinner, EmptyState, PageHeader, Spinner } from "@/components/common";
+import { useConfirm } from "@/components/confirm-dialog";
 import { DataTable } from "@/components/data-table";
 import { NoInstance } from "@/components/no-instance";
 import { UrlGroupFormDialog } from "@/components/url-form";
@@ -19,6 +20,7 @@ import type { UrlGroupForm, UrlNode, WriteResult } from "@/lib/types";
 export function UrlsPage() {
   const { instanceId } = useCurrentInstance();
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [formOpen, setFormOpen] = useState(false);
   const [formMode, setFormMode] = useState<"create" | "edit">("create");
   const [formReadOnly, setFormReadOnly] = useState(false);
@@ -127,9 +129,17 @@ export function UrlsPage() {
               type="button"
               title="删除"
               className="text-destructive transition-opacity hover:opacity-70"
-              onClick={(e) => {
+              onClick={async (e) => {
                 e.stopPropagation();
-                if (confirm(`确认删除 URL 库「${name}」？该操作会真实写入设备且不可撤销。`)) del.mutate(name);
+                if (
+                  await confirm({
+                    title: "删除 URL 库",
+                    description: `确认删除 URL 库「${name}」？该操作会真实写入设备且不可撤销。`,
+                    variant: "destructive",
+                    confirmText: "删除",
+                  })
+                )
+                  del.mutate(name);
               }}
             >
               <X className="h-4 w-4" />

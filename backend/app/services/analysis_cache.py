@@ -87,9 +87,12 @@ class TTLCache:
 
 # 分析缓存单例：按实例 id 缓存 analyze_overlaps 结果。
 analysis_cache = TTLCache(settings.analysis_cache_ttl)
+# 全局搜索索引缓存：按实例 id 缓存「应用 IP/域名 + URL 库条目」索引（构建同样需逐条访问设备）。
+search_cache = TTLCache(settings.analysis_cache_ttl)
 
 
 def invalidate_instance(instance_id: int | None) -> None:
-    """写操作后使该实例的分析缓存失效。``instance_id`` 为空时忽略。"""
+    """写操作后使该实例的分析缓存与搜索索引缓存失效。``instance_id`` 为空时忽略。"""
     if instance_id is not None:
         analysis_cache.invalidate(instance_id)
+        search_cache.invalidate(instance_id)

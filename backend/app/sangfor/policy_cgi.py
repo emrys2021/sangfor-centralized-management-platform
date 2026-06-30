@@ -3,10 +3,38 @@
 """访问权限策略 + 应用目录树 CGI 能力（``netpolicy.cgi`` / ``acnetpolicy.cgi``）。"""
 from __future__ import annotations
 
+import copy
 import re
 from typing import Any
 
 from app.sangfor.web_base import SangforWebError
+
+# 旧固件 acnetpolicy.cgi 新建策略时 ssl 段需为完整默认结构（新固件 netpolicy.cgi 用 {}）。
+# 取自南京 AC 真实「新建策略」抓包，SSL 识别默认关闭（include/enable 均 false）。
+_ACNETPOLICY_SSL_DEFAULT = {
+    "sslident": {
+        "web": {
+            "advance": {"act": "all"},
+            "apprule": {"apps": []},
+            "enable": False,
+            "proxyall": 0,
+            "decryptioncard": 0,
+            "decryptmode": "MITM",
+            "sites": (
+                "mail.qq.com\ngmail.com\nemailgoogle.com\ngoogleemail.com\nmail.google.com\n"
+                "www.gmail.com\ngroups.google.com\nsites.google.com\ndream4ever.org\nwx.qq.com\n"
+                "wx2.qq.com\nftn.qq.com\nexmail.qq.com\n"
+            ),
+            "forbidquic": False,
+        },
+        "mail": {
+            "advance": {"smtp": {"enable": True, "act": "all"}, "pop3": False},
+            "enable": False,
+            "excepts": "",
+        },
+        "include": False,
+    }
+}
 
 
 class PolicyCgiMixin:
@@ -58,6 +86,7 @@ class PolicyCgiMixin:
 
         同时返回原始 ``appctrl``，前端可折叠展示完整配置，避免信息丢失。
         """
+        self._ensure_policy_cgi()  # 旧固件走 acnetpolicy.cgi，否则 listItem 404 会误判为「策略不存在」
         result = self._post(self.NETPOLICY_CGI, {"opr": "listItem", "name": policy_name})
         appctrl = result.get("appctrl", {}) or {}
         application = appctrl.get("application", {}) or {}
@@ -278,12 +307,20 @@ class PolicyCgiMixin:
 
         ``data`` 为完整策略对象（见 :mod:`app.services.policy_template`）。适用用户由设备
         另一条 acnetpolicy 请求保存，不在此报文中。
+
+        新旧固件 add 报文结构一致，唯一差异在 ``ssl`` 段：新固件用 ``{}``，旧固件
+        （``acnetpolicy.cgi``）需完整的 ``ssl.sslident`` 默认结构——此处据探测到的路径自动补齐。
         """
+        self._ensure_policy_cgi()
+        data = dict(data)
+        if self.NETPOLICY_CGI == self.ACNETPOLICY_CGI and not data.get("ssl"):
+            data["ssl"] = copy.deepcopy(_ACNETPOLICY_SSL_DEFAULT)
         body = {"opr": "add", "data": data}
         return self._write_cgi(self.NETPOLICY_CGI, body, dry_run=dry_run)
 
     def delete_policy(self, policy_name: str, *, dry_run: bool = True) -> dict:
         """删除访问权限策略（已据真实抓包确认 ``opr=delete``，``name`` 为名称数组，支持批量）。"""
+        self._ensure_policy_cgi()
         body = {"opr": "delete", "name": [policy_name]}
         return self._write_cgi(self.NETPOLICY_CGI, body, dry_run=dry_run)
 
@@ -303,11 +340,13 @@ class PolicyCgiMixin:
         opr = {"up": "moveup", "down": "movedown"}.get(direction)
         if opr is None:
             raise SangforWebError(f"非法的移动方向：{direction!r}（应为 up/down）")
+        self._ensure_policy_cgi()
         body = {"opr": opr, "data": [{"name": [policy_name], "type": policy_type}]}
         return self._write_cgi(self.NETPOLICY_CGI, body, dry_run=dry_run)
 
     def set_policies_status(self, names: list[str], *, enabled: bool, dry_run: bool = True) -> dict:
         """批量启用 / 禁用策略（已据真实抓包确认 ``opr=enable/disable``，``name`` 为名称数组）。"""
+        self._ensure_policy_cgi()
         body = {"opr": "enable" if enabled else "disable", "name": list(names)}
         return self._write_cgi(self.NETPOLICY_CGI, body, dry_run=dry_run)
 
@@ -337,6 +376,7 @@ class PolicyCgiMixin:
             （自定义应用的 crc 为设备分配、无法由路径推导）。
         :param application_include: 若给定，覆盖 ``application.include``（是否启用应用控制）。
         """
+        self._ensure_policy_cgi()
         full = self._post(self.NETPOLICY_CGI, {"opr": "listItem", "name": policy_name})
         data = {k: v for k, v in full.items() if k not in self._POLICY_ENVELOPE_KEYS}
         data.setdefault("name", policy_name)

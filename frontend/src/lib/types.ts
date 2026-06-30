@@ -283,8 +283,10 @@ export interface TargetApplyResult {
   dry_run: boolean;
   message: string;
   payload: Record<string, unknown> | null;
-  /** 跨实例策略同步：目标缺失的被引用路径（需先同步对应自定义应用 / URL 库）。 */
+  /** 跨实例策略同步：目标缺失的内置引用路径（无法自动创建、已跳过）。 */
   warnings: string[];
+  /** 逐步结果日志（建自定义引用、写策略各请求的成功/失败与详情）。 */
+  details: string[];
 }
 
 export interface SyncApplyResult {
@@ -292,6 +294,54 @@ export interface SyncApplyResult {
   object_name: string;
   source_instance_id: number;
   results: TargetApplyResult[];
+}
+
+// ---- 批量同步 ----
+export interface BatchObjectResult {
+  name: string;
+  action: "create" | "update" | "delete" | "skip" | "fail";
+  ok: boolean;
+  message: string;
+}
+
+export interface BatchTargetResult {
+  instance_id: number;
+  instance_name: string;
+  dry_run: boolean;
+  created: string[];
+  updated: string[];
+  deleted: string[];
+  failed: BatchObjectResult[];
+  details: BatchObjectResult[];
+  error: string;
+}
+
+export interface BatchSyncResult {
+  object_type: ObjectType;
+  source_instance_id: number;
+  source_count: number;
+  mirror: boolean;
+  targets: BatchTargetResult[];
+}
+
+// ---- 全局搜索 ----
+export interface SearchHit {
+  name: string;
+  matches: string[];
+}
+
+export interface SearchResult {
+  query: string;
+  query_type: "ip" | "domain";
+  apps: SearchHit[];
+  custom_urls: SearchHit[];
+  builtin_urls: SearchHit[];
+  total_hits: number;
+  indexed_apps: number;
+  indexed_url_groups: number;
+  errors: string[];
+  cached: boolean;
+  cache_age_seconds: number;
 }
 
 export interface OverlapAppRef {

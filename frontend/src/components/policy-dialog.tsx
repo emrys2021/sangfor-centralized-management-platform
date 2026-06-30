@@ -20,6 +20,7 @@ import { Label } from "@/components/ui/label";
 import { policyApi } from "@/lib/api";
 import { refKey } from "@/lib/policy-refs";
 import type { PolicyAppRef, PolicyDetail, WriteResult } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 type DialogRule = { id: string; action: boolean; refs: PolicyAppRef[] };
 
@@ -58,6 +59,7 @@ export function PolicyDialog({
   const [rules, setRules] = useState<DialogRule[]>([]);
   const [realSubmit, setRealSubmit] = useState(false);
   const [showErrors, setShowErrors] = useState(false);
+  const [nameTouched, setNameTouched] = useState(false);
   // null=关闭；"new"=新增规则；number=编辑该索引规则
   const [pickerFor, setPickerFor] = useState<number | "new" | null>(null);
   const dryRun = !realSubmit;
@@ -79,6 +81,7 @@ export function PolicyDialog({
     }
     setRealSubmit(false);
     setShowErrors(false);
+    setNameTouched(false);
     setPickerFor(null);
   }, [open, mode, detail]);
 
@@ -91,6 +94,8 @@ export function PolicyDialog({
         : existingNames.includes(trimmed)
           ? "策略名称已存在"
           : "";
+  // 字段触碰或提交后才显示名称错误
+  const showNameError = !!nameError && (nameTouched || showErrors);
 
   const pickerInitialRefs = useMemo<PolicyAppRef[]>(
     () => (typeof pickerFor === "number" ? rules[pickerFor]?.refs ?? [] : []),
@@ -154,7 +159,7 @@ export function PolicyDialog({
             <span>当前仅配置「应用控制」；适用用户/对象与高级配置暂不在此编辑，提交时原样保留。</span>
           </div>
 
-          <div className="min-h-0 flex-1 space-y-3 overflow-auto pr-1">
+          <div className="min-h-0 flex-1 space-y-3 overflow-auto px-1">
             <label className="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -166,16 +171,21 @@ export function PolicyDialog({
             </label>
 
             <div className="space-y-1.5">
-              <Label htmlFor="pd-name">策略名称</Label>
+              <Label htmlFor="pd-name">
+                策略名称
+                {mode !== "edit" && <span className="text-destructive"> *</span>}
+              </Label>
               <Input
                 id="pd-name"
                 value={name}
                 disabled={mode === "edit"}
                 onChange={(e) => setName(e.target.value)}
+                onBlur={() => setNameTouched(true)}
+                className={cn(showNameError && "border-destructive focus-visible:ring-destructive")}
                 placeholder="例如：测试白名单"
               />
               {mode === "edit" && <p className="text-xs text-muted-foreground">编辑按名称匹配，暂不支持改名。</p>}
-              {showErrors && nameError && <p className="text-xs text-destructive">{nameError}</p>}
+              {showNameError && <p className="text-xs text-destructive">{nameError}</p>}
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="pd-depict">描述信息</Label>

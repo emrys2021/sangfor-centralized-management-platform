@@ -18,6 +18,7 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { urlApi } from "@/lib/api";
 import type { UrlGroupForm as UrlForm, WriteResult } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 const EMPTY: UrlForm = { name: "", depict: "", url: "", keyword: "" };
 
@@ -49,6 +50,7 @@ export function UrlGroupFormDialog({
   const [form, setForm] = useState<UrlForm>(EMPTY);
   const [realSubmit, setRealSubmit] = useState(false);
   const [showErrors, setShowErrors] = useState(false);
+  const [nameTouched, setNameTouched] = useState(false);
   const dryRun = !realSubmit;
 
   useEffect(() => {
@@ -56,12 +58,15 @@ export function UrlGroupFormDialog({
     setForm(initial ?? EMPTY);
     setRealSubmit(false);
     setShowErrors(false);
+    setNameTouched(false);
   }, [open, initial]);
 
   const set = <K extends keyof UrlForm>(k: K, v: UrlForm[K]) => setForm((f) => ({ ...f, [k]: v }));
 
   const nameError = !form.name.trim();
   const nameDisabled = readOnly || mode === "edit";
+  // 名称为编辑/只读时不校验；否则字段触碰或提交后才显示错误
+  const showNameError = !nameDisabled && nameError && (nameTouched || showErrors);
 
   const submit = useMutation({
     mutationFn: () =>
@@ -99,20 +104,25 @@ export function UrlGroupFormDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="min-h-0 flex-1 space-y-3 overflow-auto pr-1">
+        <div className="min-h-0 flex-1 space-y-3 overflow-auto px-1">
           <div className="space-y-1.5">
-            <Label htmlFor="url-name">URL 组名称</Label>
+            <Label htmlFor="url-name">
+              URL 组名称
+              {!nameDisabled && <span className="text-destructive"> *</span>}
+            </Label>
             <Input
               id="url-name"
               value={form.name}
               disabled={nameDisabled}
               onChange={(e) => set("name", e.target.value)}
+              onBlur={() => setNameTouched(true)}
+              className={cn(showNameError && "border-destructive focus-visible:ring-destructive")}
               placeholder="例如：阿里云无影云桌面"
             />
             {mode === "edit" && !readOnly && (
               <p className="text-xs text-muted-foreground">编辑按组名匹配，暂不支持改名。</p>
             )}
-            {showErrors && nameError && <p className="text-xs text-destructive">URL 组名称不允许为空</p>}
+            {showNameError && <p className="text-xs text-destructive">URL 组名称不允许为空</p>}
           </div>
 
           <div className="space-y-1.5">

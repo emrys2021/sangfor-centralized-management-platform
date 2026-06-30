@@ -7,6 +7,7 @@ import { AuditPage } from "@/pages/audit";
 import { CustomRulesPage } from "@/pages/customrules";
 import { InstancesPage } from "@/pages/instances";
 import { PoliciesPage } from "@/pages/policies";
+import { SearchPage } from "@/pages/search";
 import { SyncPage } from "@/pages/sync";
 import { UrlsPage } from "@/pages/urls";
 
@@ -33,6 +34,7 @@ export const router = createBrowserRouter([
         ),
       },
       { path: "sync", element: <SyncPage /> },
+      { path: "search", element: <SearchPage /> },
       { path: "audit", element: <AuditPage /> },
       { path: "instances", element: <InstancesPage /> },
     ],

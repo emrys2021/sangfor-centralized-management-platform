@@ -29,7 +29,10 @@ export default defineConfig({
     chunkSizeWarningLimit: 1200,
   },
   server: {
-    port: 5173,
+    // 5173 在部分 Windows 上落入 WinNAT 动态保留端口段（随重启/Docker/WSL 变化）会报
+    // EACCES（端口空着但被系统保留、非进程占用），固定到空闲的 5050 规避
+    host: "127.0.0.1",
+    port: 5050,
     proxy: {
       "/api": {
         target: "http://127.0.0.1:8000",

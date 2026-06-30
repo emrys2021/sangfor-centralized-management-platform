@@ -34,6 +34,9 @@ from app.sangfor import session_pool
 from app.sangfor.web_base import SangforWebError
 from app.sangfor.web_client import SangforWebClient
 from app.schemas.sync import (
+    BatchObjectResult,
+    BatchSyncResult,
+    BatchTargetResult,
     FieldDiff,
     SyncApplyResult,
     SyncDiffResult,
@@ -79,11 +82,18 @@ def _build_snapshot(web: SangforWebClient, object_type: str, name: str) -> tuple
             }, ""
         if object_type == "policy":
             detail = web.get_policy_detail(name)
+            # 保留 custom 标记，供前端把引用分「内置/自定义 应用、内置/自定义 URL 库」展示
             rules = [
                 {
                     "name": r["name"],
-                    "apps": sorted(a["path"] for a in r["apps"]),
-                    "urls": sorted(u["name"] for u in r["urls"]),
+                    "apps": sorted(
+                        ({"path": a["path"], "custom": bool(a.get("custom"))} for a in r["apps"]),
+                        key=lambda x: x["path"],
+                    ),
+                    "urls": sorted(
+                        ({"name": u["name"], "custom": bool(u.get("custom"))} for u in r["urls"]),
+                        key=lambda x: x["name"],
+                    ),
                 }
                 for r in detail.get("rules", [])
             ]
@@ -183,6 +193,7 @@ def _write_to_target(
     source_policy_detail: dict | None = None,
     source_custom_apps: set[str] | None = None,
     source_custom_urls: set[str] | None = None,
+    policy_app_index: dict | None = None,
 ) -> dict:
     """根据对象是否已存在选择 create / update。三类对象均支持真实写入。
 
@@ -220,6 +231,7 @@ def _write_to_target(
             dry_run=dry_run,
             source_custom_apps=source_custom_apps or set(),
             source_custom_urls=source_custom_urls or set(),
+            app_index=policy_app_index,
         )
     raise ValueError(f"未知对象类型: {object_type}")
 
@@ -297,28 +309,37 @@ def apply_sync(
                 source_custom_apps=source_custom_apps,
                 source_custom_urls=source_custom_urls,
             )
-            # 到这里未抛异常即视为成功（dry-run 预览或真实提交均已通过 _post 的 success 校验）
-            committed = not outcome.get("dry_run", dry_run)
+            # policy 路径不抛异常、以 outcome["ok"] 表示成败；customrule/url 无 ok 键默认成功
+            ok = bool(outcome.get("ok", True))
+            committed = ok and not outcome.get("dry_run", dry_run)
             if committed:
                 invalidate_instance(tid)  # 真实写入后让目标实例的分析缓存失效
             verb = "更新" if exists else "新增"
             missing = outcome.get("missing") or []
             created = outcome.get("created") or []
-            # 策略同步附注：自动创建的引用对象 + 仍缺失（内置/源也无、无法自动创建）的引用
+            details = outcome.get("details") or []
+            # 策略同步附注：自动创建的自定义引用对象 + 被跳过的内置缺失引用
             note = ""
             if created:
-                note += f"；{'将' if not committed else ''}自动创建 {len(created)} 个被引用对象"
+                note += f"；{'将' if not committed else ''}创建/更新 {len(created)} 个自定义引用对象"
             if missing:
-                note += f"；{len(missing)} 个内置引用在目标缺失、无法自动创建"
+                note += f"；{len(missing)} 个内置引用目标缺失、无法创建，已跳过这些引用"
+            if not ok:
+                base_msg = f"同步失败（{verb}）"
+            elif committed:
+                base_msg = f"已{verb}"
+            else:
+                base_msg = f"dry_run 预览（将{verb}）"
             results.append(
                 TargetApplyResult(
                     instance_id=tid,
                     instance_name=target_inst.name,
-                    success=True,
+                    success=ok,
                     dry_run=outcome.get("dry_run", dry_run),
-                    message=(f"已{verb}" if committed else f"dry_run 预览（将{verb}）") + note,
+                    message=base_msg + note,
                     payload=outcome.get("payload"),
                     warnings=list(missing),
+                    details=list(details),
                 )
             )
             audit.record(
@@ -329,10 +350,11 @@ def apply_sync(
                 object_name=f"{object_type}:{object_name}",
                 instance_id=tid,
                 instance_name=target_inst.name,
-                success=True,
+                success=ok,
                 message=f"同步「{object_name}」：{source_inst.name} → {target_inst.name}（{verb}）"
                 + ("（dry-run）" if (dry_run or outcome.get("dry_run")) else "")
-                + note,
+                + note
+                + ("；".join([""] + details) if details else ""),
                 before=None,
                 after=outcome.get("payload") or outcome.get("result"),
             )
@@ -348,4 +370,193 @@ def apply_sync(
         object_name=object_name,
         source_instance_id=source_instance_id,
         results=results,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 批量同步：把某类对象的全部从源同步到目标（可选镜像删除）
+# --------------------------------------------------------------------------- #
+def _list_object_names(web: SangforWebClient, object_type: str) -> list[str]:
+    """列出某实例上某类对象的名称（URL 仅取**自定义**库，内置库不参与批量/镜像）。"""
+    if object_type == "customrule":
+        return [s["rulename"] for s in web.list_custom_rules() if s.get("rulename")]
+    if object_type == "url":
+        return [
+            n["name"]
+            for n in web.list_url_groups().get("flat", []) or []
+            if n.get("name") and not n.get("inside")
+        ]
+    return [p["name"] for p in web.list_policies().get("access_policies", []) if p.get("name")]
+
+
+def _delete_from_target(web: SangforWebClient, object_type: str, name: str, dry_run: bool) -> dict:
+    """镜像模式：删除目标上「源没有」的对象（复用各类已确认的删除接口）。"""
+    if object_type == "customrule":
+        return web.delete_custom_rule(name, dry_run=dry_run)
+    if object_type == "url":
+        return web.delete_url_group(name, dry_run=dry_run)
+    return web.delete_policy(name, dry_run=dry_run)
+
+
+def batch_sync(
+    db: Session,
+    user: CurrentUser,
+    *,
+    object_type: str,
+    source_instance_id: int,
+    target_instance_ids: list[int],
+    push_all: bool,
+    mirror: bool,
+    dry_run: bool,
+) -> BatchSyncResult:
+    """把源实例某类对象的**全部**同步到目标：逐对象 upsert；``mirror`` 时删除目标多余对象。
+
+    复用单对象写路径（``_write_to_target``），自定义应用/URL 直写、策略带 crc 重映射与自动
+    建引用。性能：源对象列表与（策略用的）源自定义名单各预读一次；每个目标的应用树索引建一次、
+    复用给该目标的每条策略。
+    """
+    source_inst = instance_service.get_instance(db, source_instance_id)
+    if not source_inst:
+        raise ValueError("源实例不存在")
+    source_web = session_pool.get_web_client(source_inst)
+    source_names = _list_object_names(source_web, object_type)
+    source_name_set = set(source_names)
+
+    # 策略：源自定义应用 / URL 名单预读一次（供 crc 重映射的自动建引用使用）。
+    # 仅真实写入时需要——dry-run 预览只按名称分类、不逐个拉详情，故跳过。
+    source_custom_apps: set[str] = set()
+    source_custom_urls: set[str] = set()
+    if object_type == "policy" and not dry_run:
+        source_custom_apps = {s.get("rulename") for s in source_web.list_custom_rules() if s.get("rulename")}
+        source_custom_urls = {
+            n.get("name")
+            for n in source_web.list_url_groups().get("flat", [])
+            if n.get("name") and not n.get("inside")
+        }
+
+    if push_all:
+        all_enabled = instance_service.list_instances(db, only_enabled=True)
+        target_ids = [i.id for i in all_enabled if i.id != source_instance_id]
+    else:
+        target_ids = [tid for tid in target_instance_ids if tid != source_instance_id]
+
+    targets: list[BatchTargetResult] = []
+    for tid in target_ids:
+        target_inst = instance_service.get_instance(db, tid)
+        if not target_inst:
+            targets.append(
+                BatchTargetResult(instance_id=tid, instance_name=f"#{tid}", dry_run=dry_run, error="目标实例不存在")
+            )
+            continue
+        try:
+            web = session_pool.get_web_client(target_inst)
+            target_names = _list_object_names(web, object_type)
+        except Exception as exc:  # noqa: BLE001  连接/登录失败
+            targets.append(
+                BatchTargetResult(
+                    instance_id=tid, instance_name=target_inst.name, dry_run=dry_run, error=f"读取目标失败：{exc}"
+                )
+            )
+            continue
+        target_name_set = set(target_names)
+
+        # 策略：本目标的应用树索引建一次，复用给每条策略（免逐条重复拉取）。仅真实写入时需要。
+        policy_index = None
+        if object_type == "policy" and not dry_run:
+            try:
+                policy_index = policy_sync.build_app_index(web.list_app_tree())
+            except Exception:  # noqa: BLE001  取不到则各策略自行拉取
+                policy_index = None
+
+        created: list[str] = []
+        updated: list[str] = []
+        deleted: list[str] = []
+        failed: list[BatchObjectResult] = []
+        details: list[BatchObjectResult] = []
+
+        # 1) upsert：目标已有同名→更新（覆盖为与源一致），否则新增。
+        # **dry-run 预览仅按名称分类**——不逐个拉源详情/建报文（那样每对象一次 listItem、N 个串行很慢）。
+        for name in source_names:
+            exists = name in target_name_set
+            if dry_run:
+                (updated if exists else created).append(name)
+                details.append(BatchObjectResult(name=name, action="update" if exists else "create", ok=True))
+                continue
+            try:
+                if object_type == "policy":
+                    detail = source_web.get_policy_detail(name)
+                    outcome = _write_to_target(
+                        web, object_type, {}, exists, dry_run,
+                        source_web=source_web, source_policy_detail=detail,
+                        source_custom_apps=source_custom_apps, source_custom_urls=source_custom_urls,
+                        policy_app_index=policy_index,
+                    )
+                    op_ok = outcome.get("ok", True)
+                else:
+                    st, snap, err = _build_snapshot(source_web, object_type, name)
+                    if st != "found":
+                        failed.append(
+                            BatchObjectResult(name=name, action="fail", ok=False, message=f"读取源失败：{err}")
+                        )
+                        continue
+                    outcome = _write_to_target(web, object_type, dict(snap), exists, dry_run)
+                    op_ok = True
+                invalidate_instance(tid)
+                if not op_ok:  # 策略写失败（ok=False，不抛）
+                    msg = "；".join(outcome.get("details", [])) or "写入失败"
+                    failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=msg))
+                else:
+                    (updated if exists else created).append(name)
+                    details.append(BatchObjectResult(name=name, action="update" if exists else "create", ok=True))
+            except Exception as exc:  # noqa: BLE001  单对象失败不拖垮整体
+                failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=str(exc)))
+
+        # 2) 镜像删除：目标上源没有的对象
+        if mirror:
+            for name in sorted(target_name_set - source_name_set):
+                if dry_run:  # 预览只列名单，不发删除请求
+                    deleted.append(name)
+                    details.append(
+                        BatchObjectResult(name=name, action="delete", ok=True, message="镜像删除（源中不存在）")
+                    )
+                    continue
+                try:
+                    _delete_from_target(web, object_type, name, dry_run)
+                    invalidate_instance(tid)
+                    deleted.append(name)
+                    details.append(
+                        BatchObjectResult(name=name, action="delete", ok=True, message="镜像删除（源中不存在）")
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=f"删除失败：{exc}"))
+
+        targets.append(
+            BatchTargetResult(
+                instance_id=tid, instance_name=target_inst.name, dry_run=dry_run,
+                created=created, updated=updated, deleted=deleted, failed=failed, details=details,
+            )
+        )
+        audit.record(
+            db,
+            actor=user.username,
+            object_type="sync",
+            action="dry_run" if dry_run else "sync",
+            object_name=f"{object_type}:batch",
+            instance_id=tid,
+            instance_name=target_inst.name,
+            success=len(failed) == 0,
+            message=f"批量同步 {object_type}：{source_inst.name} → {target_inst.name}"
+            + f"（新增 {len(created)}/覆盖 {len(updated)}/删除 {len(deleted)}/失败 {len(failed)}）"
+            + ("（dry-run）" if dry_run else "")
+            + ("（镜像）" if mirror else ""),
+            before=None,
+            after=None,
+        )
+
+    return BatchSyncResult(
+        object_type=object_type,
+        source_instance_id=source_instance_id,
+        source_count=len(source_names),
+        mirror=mirror,
+        targets=targets,
     )

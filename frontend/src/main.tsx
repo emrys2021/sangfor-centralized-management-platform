@@ -4,6 +4,7 @@ import ReactDOM from "react-dom/client";
 import { RouterProvider } from "react-router-dom";
 import { Toaster } from "sonner";
 
+import { ConfirmProvider } from "./components/confirm-dialog";
 import { router } from "./router";
 import { useAppStore } from "./stores/app";
 
@@ -20,7 +21,9 @@ const queryClient = new QueryClient({
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <ConfirmProvider>
+        <RouterProvider router={router} />
+      </ConfirmProvider>
       <Toaster richColors position="top-right" theme={initialTheme} />
     </QueryClientProvider>
   </React.StrictMode>

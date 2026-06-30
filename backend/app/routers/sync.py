@@ -11,6 +11,8 @@ from app.core.auth import CurrentUser, get_current_user
 from app.db.base import get_db
 from app.sangfor.web_client import SangforWebError
 from app.schemas.sync import (
+    BatchSyncRequest,
+    BatchSyncResult,
     SyncApplyRequest,
     SyncApplyResult,
     SyncDiffRequest,
@@ -31,6 +33,30 @@ def compute_diff(req: SyncDiffRequest, db: Session = Depends(get_db)):
             req.object_name,
             req.source_instance_id,
             req.target_instance_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except SangforWebError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/batch", response_model=BatchSyncResult)
+def batch_sync(
+    req: BatchSyncRequest,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """批量同步：把源实例某类对象的全部同步到目标；``mirror=True`` 时删除目标多余对象。默认 dry-run。"""
+    try:
+        return sync_service.batch_sync(
+            db,
+            user,
+            object_type=req.object_type,
+            source_instance_id=req.source_instance_id,
+            target_instance_ids=req.target_instance_ids,
+            push_all=req.push_all,
+            mirror=req.mirror,
+            dry_run=req.dry_run,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

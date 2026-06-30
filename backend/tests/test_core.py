@@ -25,6 +25,7 @@ def test_encrypt_roundtrip():
 def _client() -> SangforWebClient:
     c = SangforWebClient("https", "127.0.0.1", 443, "u", "p")
     c._logged_in = True  # 跳过真实登录
+    c._policy_cgi_detected = True  # 跳过策略 CGI 路径探测（默认 netpolicy.cgi）
     return c
 
 
@@ -964,8 +965,7 @@ def test_build_app_index_flattens_tree_with_crc():
 def _source_policy_detail():
     """源策略完整详情：两个引用，crc 为源设备值（应被目标覆盖）。
 
-    含 ``rules``（get_policy_detail 解析结果，供 build_remapped_rules 使用）与 ``raw``
-    （完整对象，供 add 路径 remap_policy_data 使用）。
+    ``rules`` 为 get_policy_detail 解析结果，供 build_remapped_rules 重映射 crc。
     """
     return {
         "policy_name": "测试策略",
@@ -999,7 +999,12 @@ def _source_policy_detail():
                             "apps": {
                                 "apps": [
                                     {"path": "自定义/钉钉应用", "type": "app", "crc": "S-9001", "extra": ""},
-                                    {"path": "访问网站/钉钉白名单/网站浏览", "type": "power", "crc": "S-9002", "extra": "url"},
+                                    {
+                                        "path": "访问网站/钉钉白名单/网站浏览",
+                                        "type": "power",
+                                        "crc": "S-9002",
+                                        "extra": "url",
+                                    },
                                 ],
                                 "tags": [],
                                 "extra": [],
@@ -1010,47 +1015,6 @@ def _source_policy_detail():
             },
         },
     }
-
-
-def test_remap_policy_data_replaces_crc_and_strips_envelope():
-    """crc 用目标值覆盖、信封与适用对象剔除、其余字段保留。"""
-    from app.services.policy_sync import build_app_index, remap_policy_data
-
-    index = build_app_index(_sample_app_tree())
-    data, missing = remap_policy_data(_source_policy_detail(), index)
-
-    assert missing == []
-    assert "success" not in data and "use_info" not in data  # 信封 / 适用对象剔除
-    refs = data["appctrl"]["application"]["data"][0]["apps"]["apps"]
-    assert refs[0]["crc"] == "T-2002"  # 自定义应用 → 目标 crc
-    assert refs[1]["crc"] == "T-3003"  # 访问网站 → 目标 crc
-    assert refs[0]["path"] == "自定义/钉钉应用"  # 路径等非 crc 字段原样保留
-    assert data["appctrl"]["application"]["include"] is True
-
-
-def test_remap_policy_data_reports_missing_reference():
-    """目标缺被引用对象时记入 missing，且不臆造 crc。"""
-    from app.services.policy_sync import remap_policy_data
-
-    # 目标 app 树缺「自定义/钉钉应用」，仅有访问网站
-    index = {"访问网站/钉钉白名单/网站浏览": {"crc": "T-3003", "type": "power"}}
-    data, missing = remap_policy_data(_source_policy_detail(), index)
-
-    assert missing == ["自定义/钉钉应用"]
-    refs = data["appctrl"]["application"]["data"][0]["apps"]["apps"]
-    assert refs[0]["crc"] == "S-9001"  # 缺失项保持原值（不臆造），由调用方阻止落盘
-
-
-def test_remap_policy_data_does_not_mutate_source():
-    """重建为深拷贝，不污染源详情对象（同源可重复用于多个目标）。"""
-    from app.services.policy_sync import build_app_index, remap_policy_data
-
-    src = _source_policy_detail()
-    index = build_app_index(_sample_app_tree())
-    remap_policy_data(src, index)
-    # 源对象的 crc 未被改动
-    src_refs = src["raw"]["appctrl"]["application"]["data"][0]["apps"]["apps"]
-    assert src_refs[0]["crc"] == "S-9001"
 
 
 def test_build_remapped_rules_maps_crc_to_target():
@@ -1068,10 +1032,10 @@ def test_build_remapped_rules_maps_crc_to_target():
 
 
 def test_classify_missing_splits_creatable_and_builtin():
-    """缺失引用区分可创建（源自定义）与硬缺失（内置/源也无）。"""
+    """缺失引用区分可创建（源自定义）与内置缺失（无法创建）。"""
     from app.services.policy_sync import classify_missing
 
-    creatable, hard = classify_missing(
+    creatable, builtin = classify_missing(
         ["自定义/钉钉应用", "访问网站/钉钉白名单/网站浏览", "Web流媒体/全部"],
         source_custom_apps={"钉钉应用"},
         source_custom_urls={"钉钉白名单"},
@@ -1079,22 +1043,77 @@ def test_classify_missing_splits_creatable_and_builtin():
     paths = {c["path"]: c for c in creatable}
     assert paths["自定义/钉钉应用"]["kind"] == "app" and paths["自定义/钉钉应用"]["name"] == "钉钉应用"
     assert paths["访问网站/钉钉白名单/网站浏览"]["kind"] == "url"
-    assert hard == ["Web流媒体/全部"]  # 内置应用无法自动创建
+    assert builtin == ["Web流媒体/全部"]  # 内置应用无法自动创建
+
+
+def test_classify_missing_matches_glued_custom_app_prefix():
+    """自定义应用名与「自定义」前缀粘连成一段时仍能识别（修复 自定义应用_AIGC应用 漏判）。"""
+    from app.services.policy_sync import classify_missing
+
+    creatable, builtin = classify_missing(
+        ["自定义应用_AIGC应用/全部", "AI_Agent/全部", "大模型API/全部"],
+        source_custom_apps={"AIGC应用"},
+        source_custom_urls=set(),
+    )
+    assert len(creatable) == 1
+    assert creatable[0]["kind"] == "app" and creatable[0]["name"] == "AIGC应用"
+    # AI_Agent / 大模型API 为内置（未以「自定义」开头、也非源自定义应用）
+    assert builtin == ["AI_Agent/全部", "大模型API/全部"]
+
+
+class _FakeSourceWeb:
+    """源设备替身：提供被引用对象的详情供 ensure 复制到目标。"""
+
+    def get_url_group_detail(self, name):
+        return {"depict": "d", "url_text": "a.com\nb.com", "keyword": ""}
+
+    def get_custom_rule_detail(self, name):
+        return {"summary": {"rulename": name}, "detail": {}}
 
 
 class _FakeTargetWeb:
-    """记录写调用的目标设备替身。"""
+    """记录写调用的目标设备替身。``existing_apps`` / ``existing_urls`` 模拟目标已有的同名对象。"""
 
-    def __init__(self, tree, *, has_policy):
+    def __init__(self, tree, *, has_policy, existing_apps=(), existing_urls=()):
         self._tree = tree
         self._has_policy = has_policy
+        self._existing_apps = set(existing_apps)
+        self._existing_urls = set(existing_urls)
         self.modify_calls: list = []
         self.create_policy_calls: list = []
+        self.created_apps: list = []
+        self.updated_apps: list = []
+        self.created_urls: list = []
+        self.updated_urls: list = []
 
     def list_app_tree(self):
         return self._tree
 
+    def list_custom_rules(self):
+        return [{"rulename": n} for n in self._existing_apps]
+
+    def list_url_groups(self):
+        return {"flat": [{"name": n, "inside": ""} for n in self._existing_urls]}
+
+    def create_custom_rule(self, data, *, dry_run=True):
+        self.created_apps.append(data)
+        return {"dry_run": dry_run, "payload": data}
+
+    def update_custom_rule(self, data, *, dry_run=True):
+        self.updated_apps.append(data)
+        return {"dry_run": dry_run, "payload": data}
+
+    def create_url_group(self, data, *, dry_run=True):
+        self.created_urls.append(data)
+        return {"dry_run": dry_run, "payload": data}
+
+    def update_url_group(self, data, *, dry_run=True):
+        self.updated_urls.append(data)
+        return {"dry_run": dry_run, "payload": data}
+
     def modify_policy_application(self, name, rules, **kw):
+        if getattr(self, "fail_write", False):
+            raise SangforWebError("/cgi-bin/netpolicy.cgi（opr=modify）返回失败：设备拒绝")
         self.modify_calls.append((name, rules, kw))
         return {"dry_run": kw.get("dry_run", True), "payload": {"opr": "modify", "name": name}}
 
@@ -1119,7 +1138,7 @@ def test_sync_policy_modify_uses_proven_contract_when_exists():
 
 
 def test_sync_policy_add_uses_create_policy_when_absent():
-    """目标无此策略 → 走 create_policy（opr=add），data crc 已重映射。"""
+    """目标无此策略 → 走 create_policy（opr=add），用已验证骨架（非源原始对象）+ crc 已重映射。"""
     from app.services.policy_sync import sync_policy_to_target
 
     target = _FakeTargetWeb(_sample_app_tree(), has_policy=False)
@@ -1131,6 +1150,10 @@ def test_sync_policy_add_uses_create_policy_when_absent():
     data, _ = target.create_policy_calls[0]
     refs = data["appctrl"]["application"]["data"][0]["apps"]["apps"]
     assert [r["crc"] for r in refs] == ["T-2002", "T-3003"]
+    # 用 policy_template 骨架：带骨架默认字段、规则 ID 由模板生成（不是源 rule_id）
+    assert data["type"] == 1 and "samerole" in data and data["name"] == "测试策略"
+    assert data["appctrl"]["application"]["data"][0]["name"] != "rule-src-1"
+    assert data["appctrl"]["application"]["data"][0]["time"] == "全天"
 
 
 def test_sync_policy_dry_run_previews_autocreate_without_blocking():
@@ -1148,28 +1171,75 @@ def test_sync_policy_dry_run_previews_autocreate_without_blocking():
                         "name": "钉钉白名单",
                         "type": "catagory",
                         "children": [
-                            {"name": "网站浏览", "type": "power", "value": "访问网站/钉钉白名单/网站浏览", "crc": "T-3003", "extra": "url"},
+                            {
+                                "name": "网站浏览",
+                                "type": "power",
+                                "value": "访问网站/钉钉白名单/网站浏览",
+                                "crc": "T-3003",
+                                "extra": "url",
+                            },
                         ],
                     }
                 ],
             }
         ]
     }
-    target = _FakeTargetWeb(partial_tree, has_policy=True)
+    target = _FakeTargetWeb(partial_tree, has_policy=True)  # 目标无同名应用 → 将创建
     out = sync_policy_to_target(
-        source_web=None, target_web=target, source_detail=_source_policy_detail(),
+        source_web=_FakeSourceWeb(), target_web=target, source_detail=_source_policy_detail(),
         exists=True, dry_run=True,
         source_custom_apps={"钉钉应用"}, source_custom_urls={"钉钉白名单"},
     )
-    assert out["created"] == ["自定义/钉钉应用"]  # 源自定义应用 → 预告将创建
+    assert out["created"] == ["钉钉应用"]  # 源自定义应用 → 预告将创建（按名）
     assert out["missing"] == []  # 钉钉应用可创建、访问网站已存在，无硬缺失
+    assert any("将创建自定义应用「钉钉应用」" in d for d in out["details"])
 
 
-def test_sync_policy_real_write_blocks_on_builtin_missing():
-    """real-write：遇无法自动创建的内置缺失 → 抛错整体阻止，不写策略。"""
+def test_sync_policy_updates_existing_referenced_object_not_add():
+    """目标已有同名被引用对象 → 走 update（改成一致），不走 add（不再报「名字已被使用」）。"""
     from app.services.policy_sync import sync_policy_to_target
 
-    # 目标缺内置「Web流媒体/全部」，源详情引用它
+    partial_tree = {
+        "data": [
+            {"name": "访问网站", "type": "catagory", "children": [
+                {"name": "钉钉白名单", "type": "catagory", "children": [
+                    {"name": "网站浏览", "type": "power", "value": "访问网站/钉钉白名单/网站浏览",
+                     "crc": "T-3003", "extra": "url"}]}]},
+        ]
+    }
+    # 目标已存在同名自定义应用「钉钉应用」
+    target = _FakeTargetWeb(partial_tree, has_policy=True, existing_apps={"钉钉应用"})
+    out = sync_policy_to_target(
+        source_web=_FakeSourceWeb(), target_web=target, source_detail=_source_policy_detail(),
+        exists=True, dry_run=False,
+        source_custom_apps={"钉钉应用"}, source_custom_urls={"钉钉白名单"},
+    )
+    assert target.updated_apps and not target.created_apps  # 走更新而非新增
+    assert any("已更新自定义应用「钉钉应用」（目标已存在" in d for d in out["details"])
+
+
+def test_ensure_referenced_objects_dedupes_by_name():
+    """同一对象被多个引用路径命中只处理一次（避免重复 add）。"""
+    from app.services.policy_sync import ensure_referenced_objects
+
+    target = _FakeTargetWeb(_sample_app_tree(), has_policy=True)
+    creatable = [
+        {"path": "访问网站/钉钉白名单/网站浏览", "kind": "url", "name": "钉钉白名单"},
+        {"path": "访问网站/钉钉白名单/文件上传", "kind": "url", "name": "钉钉白名单"},
+        {"path": "访问网站/钉钉白名单/HTTPS", "kind": "url", "name": "钉钉白名单"},
+    ]
+    created, updated, failed = ensure_referenced_objects(
+        _FakeSourceWeb(), target, creatable, dry_run=False
+    )
+    assert len(target.created_urls) == 1  # 三个路径同名 → 只建一次
+    assert len(created) == 1 and not updated and not failed
+
+
+def test_sync_policy_real_write_skips_builtin_missing():
+    """real-write 最大努力：内置缺失引用被跳过、策略照常写入，跳过项计入 missing。"""
+    from app.services.policy_sync import sync_policy_to_target
+
+    # 目标缺内置「Web流媒体/全部」，源详情额外引用它
     detail = _source_policy_detail()
     detail["rules"][0]["refs"].append({"path": "Web流媒体/全部", "type": "app", "crc": "S-1", "extra": ""})
     partial_tree = {
@@ -1178,13 +1248,237 @@ def test_sync_policy_real_write_blocks_on_builtin_missing():
                 {"name": "钉钉应用", "type": "app", "value": "自定义/钉钉应用", "crc": "T-2002"}]},
             {"name": "访问网站", "type": "catagory", "children": [
                 {"name": "钉钉白名单", "type": "catagory", "children": [
-                    {"name": "网站浏览", "type": "power", "value": "访问网站/钉钉白名单/网站浏览", "crc": "T-3003", "extra": "url"}]}]},
+                    {"name": "网站浏览", "type": "power", "value": "访问网站/钉钉白名单/网站浏览",
+                     "crc": "T-3003", "extra": "url"}]}]},
         ]
     }
     target = _FakeTargetWeb(partial_tree, has_policy=True)
-    with pytest.raises(SangforWebError):
-        sync_policy_to_target(
-            source_web=None, target_web=target, source_detail=detail,
-            exists=True, dry_run=False, source_custom_apps=set(), source_custom_urls=set(),
-        )
-    assert not target.modify_calls  # 未写策略
+    out = sync_policy_to_target(
+        source_web=None, target_web=target, source_detail=detail,
+        exists=True, dry_run=False, source_custom_apps=set(), source_custom_urls=set(),
+    )
+    # 策略照常写入（最大努力），内置缺失引用被丢弃并计入 missing
+    assert out["ok"] is True
+    assert len(target.modify_calls) == 1
+    _, rules, _ = target.modify_calls[0]
+    ref_paths = {r["path"] for r in rules[0]["refs"]}
+    assert "Web流媒体/全部" not in ref_paths  # 被跳过
+    assert "自定义/钉钉应用" in ref_paths and "访问网站/钉钉白名单/网站浏览" in ref_paths  # 其余照常
+    assert out["missing"] == ["Web流媒体/全部"]
+
+
+def test_sync_policy_write_failure_returns_ok_false_with_details():
+    """写策略失败：不抛异常，以 ok=False + 逐步详情返回，含设备返回的 path/opr/原因。"""
+    from app.services.policy_sync import sync_policy_to_target
+
+    target = _FakeTargetWeb(_sample_app_tree(), has_policy=True)
+    target.fail_write = True
+    out = sync_policy_to_target(
+        source_web=None, target_web=target, source_detail=_source_policy_detail(),
+        exists=True, dry_run=False, source_custom_apps=set(), source_custom_urls=set(),
+    )
+    assert out["ok"] is False
+    assert any("更新策略：失败" in d for d in out["details"])
+    assert any("netpolicy.cgi" in d for d in out["details"])  # 详情含具体接口与原因
+
+
+def test_post_failure_message_includes_path_opr_and_response(monkeypatch):
+    """设备 success=false 且无 msg：错误带 path / opr 与响应片段，而非干巴巴「接口返回失败」。"""
+    c = SangforWebClient("https", "h", 443, "u", "p")
+    c._logged_in = True
+
+    class _Resp:
+        status_code = 200
+        text = ""
+        apparent_encoding = "utf-8"
+        encoding = "utf-8"
+
+        def json(self):
+            return {"success": False, "errcode": 7}  # 无 msg
+
+    monkeypatch.setattr(c.session, "post", lambda *a, **k: _Resp())
+    with pytest.raises(SangforWebError) as ei:
+        c._post("/cgi-bin/netpolicy.cgi", {"opr": "modify"})
+    msg = str(ei.value)
+    assert "netpolicy.cgi" in msg and "opr=modify" in msg and "errcode" in msg
+
+
+# --------------------------------------------------------------------------- #
+# 全局搜索：智能匹配（域名通配/子域 + IP 网段/范围）
+# --------------------------------------------------------------------------- #
+
+def test_search_domain_wildcard_and_subdomain_matching():
+    """域名智能匹配：通配符、子域双向归属，且不误命中相似域。"""
+    from app.services.search_service import _domain_match
+
+    # 通配符条目命中查询的具体子域
+    assert _domain_match("*.deepin.org", "www.deepin.org")
+    assert _domain_match("*.deepin.org", "deepin.org")
+    # 精确条目：查询子域命中父域条目；查询父域命中子域条目（双向）
+    assert _domain_match("deepin.org", "www.deepin.org")
+    assert _domain_match("a.deepin.org", "deepin.org")
+    # 协议头 / 路径会被规范化
+    assert _domain_match("https://www.unitree.com/foo", "unitree.com")
+    # 不同域不应误命中（标签边界）
+    assert not _domain_match("notdeepin.org", "deepin.org")
+    assert not _domain_match("deepin.org", "deepin.com")
+
+
+def test_search_ip_cidr_and_range_matching():
+    """IP 智能匹配：单 IP / CIDR 网段 / a-b 范围的区间重叠。"""
+    from app.services.search_service import _ip_overlaps, looks_like_ip
+
+    assert looks_like_ip("10.0.0.1") and looks_like_ip("10.0.0.0/24") and looks_like_ip("10.0.0.1-10.0.0.9")
+    assert not looks_like_ip("www.deepin.org")
+    # 查询单 IP 命中包含它的网段 / 范围
+    assert _ip_overlaps("10.0.0.0/24", "10.0.0.7")
+    assert _ip_overlaps("10.0.0.1-10.0.0.9", "10.0.0.5")
+    # 反向：查询网段命中其中的单 IP 条目
+    assert _ip_overlaps("10.0.0.7", "10.0.0.0/24")
+    # 不相交
+    assert not _ip_overlaps("10.0.1.0/24", "10.0.0.7")
+
+
+def test_search_over_index_groups_apps_and_url_libraries():
+    """search() 在索引上按类型分组返回命中（应用 / 自定义URL / 内置URL）。"""
+    from app.services import search_service
+
+    index = {
+        "apps": [
+            {"name": "AIGC应用", "ips": ["42.62.43.219"], "domains": ["api.openai.com"]},
+            {"name": "其他应用", "ips": [], "domains": ["example.com"]},
+        ],
+        "urls": [
+            {"name": "IT相关", "inside": True, "entries": ["*.deepin.org", "www.unitree.com"]},
+            {"name": "我的白名单", "inside": False, "entries": ["10.0.0.0/24"]},
+        ],
+        "errors": [],
+    }
+    # 注入缓存，避免真实建索引
+    search_service.search_cache.invalidate(9999)
+    search_service.search_cache._store[9999] = (__import__("time").monotonic(), index)
+
+    class _Inst:
+        id = 9999
+
+    # 域名查询：命中内置 URL 库的通配条目
+    r = search_service.search(_Inst(), "a.deepin.org")
+    assert r["query_type"] == "domain"
+    assert [h["name"] for h in r["builtin_urls"]] == ["IT相关"]
+    assert r["builtin_urls"][0]["matches"] == ["*.deepin.org"]
+    assert not r["apps"] and not r["custom_urls"]
+
+    # IP 查询：命中自定义 URL 库网段 + 应用 IP
+    r2 = search_service.search(_Inst(), "10.0.0.9")
+    assert r2["query_type"] == "ip"
+    assert [h["name"] for h in r2["custom_urls"]] == ["我的白名单"]
+
+    r3 = search_service.search(_Inst(), "42.62.43.219")
+    assert [h["name"] for h in r3["apps"]] == ["AIGC应用"]
+
+
+# --------------------------------------------------------------------------- #
+# 批量同步：全量 upsert + 镜像删除
+# --------------------------------------------------------------------------- #
+
+class _BatchWeb:
+    """目标/源设备替身：按名单列对象、记录删除调用。"""
+
+    def __init__(self, names):
+        self._names = list(names)
+        self.deleted: list[str] = []
+
+    def list_custom_rules(self):
+        return [{"rulename": n} for n in self._names]
+
+    def delete_custom_rule(self, name, *, dry_run=True):
+        self.deleted.append(name)
+        return {"dry_run": dry_run}
+
+
+def _setup_batch(monkeypatch, source_names, target_names):
+    from app.services import sync_service
+
+    source_web, target_web = _BatchWeb(source_names), _BatchWeb(target_names)
+
+    class _Inst:
+        def __init__(self, i, n):
+            self.id, self.name = i, n
+
+    insts = {1: _Inst(1, "源"), 2: _Inst(2, "目标")}
+    webs = {1: source_web, 2: target_web}
+    monkeypatch.setattr(sync_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    monkeypatch.setattr(sync_service.session_pool, "get_web_client", lambda inst: webs[inst.id])
+    # 隔离写内部：upsert 决策（create/update/delete）才是本测试关注点
+    monkeypatch.setattr(sync_service, "_build_snapshot", lambda web, ot, name: ("found", {"name": name}, ""))
+    monkeypatch.setattr(sync_service, "_write_to_target", lambda *a, **k: {"dry_run": a[4]})
+    monkeypatch.setattr(sync_service, "invalidate_instance", lambda i: None)
+    monkeypatch.setattr(sync_service.audit, "record", lambda *a, **k: None)
+    return sync_service, target_web
+
+
+def test_batch_sync_upsert_splits_create_and_update(monkeypatch):
+    """源有目标无 → 新增；两边都有 → 更新；不开镜像不删除。"""
+    sync_service, target_web = _setup_batch(monkeypatch, ["a", "b", "c"], ["b", "c", "d"])
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="customrule", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=False, dry_run=True,
+    )
+    assert res.source_count == 3
+    t = res.targets[0]
+    assert set(t.created) == {"a"} and set(t.updated) == {"b", "c"}
+    assert t.deleted == [] and target_web.deleted == []  # 未开镜像，不删 d
+
+
+def test_batch_sync_mirror_deletes_extra_target_objects(monkeypatch):
+    """镜像模式：删除目标上「源没有」的对象（d）。"""
+    sync_service, target_web = _setup_batch(monkeypatch, ["a", "b"], ["b", "c", "d"])
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="customrule", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=True, dry_run=False,
+    )
+    t = res.targets[0]
+    assert set(t.created) == {"a"} and set(t.updated) == {"b"}
+    assert set(t.deleted) == {"c", "d"}  # 源没有的被镜像删除
+    assert set(target_web.deleted) == {"c", "d"}  # 真实调用了删除接口
+
+
+# --------------------------------------------------------------------------- #
+# 旧固件（acnetpolicy.cgi）策略写：ssl 段补齐 + 白名单
+# --------------------------------------------------------------------------- #
+
+def test_create_policy_injects_ssl_for_old_firmware():
+    """旧固件（acnetpolicy.cgi）新建策略：自动把空 ssl 补齐为完整默认结构。"""
+    c = _client()
+    c._policy_cgi_detected = True  # 跳过路径探测
+    c.NETPOLICY_CGI = c.ACNETPOLICY_CGI  # 模拟已探测为旧固件
+    out = c.create_policy(
+        {"name": "test222", "ssl": {}, "appctrl": {"application": {"data": [], "include": True}}},
+        dry_run=True,
+    )
+    body = out["payload"]
+    assert body["opr"] == "add"
+    sslident = body["data"]["ssl"]["sslident"]
+    assert sslident["include"] is False and "web" in sslident and "mail" in sslident
+
+
+def test_create_policy_keeps_empty_ssl_for_new_firmware():
+    """新固件（netpolicy.cgi）新建策略：ssl 保持 {}，不注入。"""
+    c = _client()
+    c._policy_cgi_detected = True  # 默认 netpolicy.cgi
+    out = c.create_policy(
+        {"name": "p", "ssl": {}, "appctrl": {"application": {"data": [], "include": True}}},
+        dry_run=True,
+    )
+    assert out["payload"]["data"]["ssl"] == {}
+
+
+def test_acnetpolicy_writes_are_confirmed():
+    """旧固件 acnetpolicy.cgi 的 add/modify 已登记到写白名单。"""
+    from app.sangfor.web_base import CONFIRMED_WRITES
+
+    assert ("/cgi-bin/acnetpolicy.cgi", "add") in CONFIRMED_WRITES
+    assert ("/cgi-bin/acnetpolicy.cgi", "modify") in CONFIRMED_WRITES
+

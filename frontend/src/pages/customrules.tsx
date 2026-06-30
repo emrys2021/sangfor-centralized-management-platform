@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { CenteredSpinner, EmptyState, PageHeader, Spinner } from "@/components/common";
+import { useConfirm } from "@/components/confirm-dialog";
 import { CustomRuleFormDialog, emptyCustomRuleForm } from "@/components/customrule-form";
 import { DataTable } from "@/components/data-table";
 import { NoInstance } from "@/components/no-instance";
@@ -18,6 +19,7 @@ import type { CustomRule, CustomRuleForm, WriteResult } from "@/lib/types";
 export function CustomRulesPage() {
   const { instanceId } = useCurrentInstance();
   const qc = useQueryClient();
+  const confirm = useConfirm();
   const [writeResult, setWriteResult] = useState<WriteResult | null>(null);
 
   const [formOpen, setFormOpen] = useState(false);
@@ -131,9 +133,17 @@ export function CustomRulesPage() {
               type="button"
               title="删除"
               className="text-destructive transition-opacity hover:opacity-70"
-              onClick={(e) => {
+              onClick={async (e) => {
                 e.stopPropagation();
-                if (confirm(`确认删除「${name}」？将真实写入设备，且不可撤销。`)) del.mutate(name);
+                if (
+                  await confirm({
+                    title: "删除自定义应用",
+                    description: `确认删除「${name}」？将真实写入设备，且不可撤销。`,
+                    variant: "destructive",
+                    confirmText: "删除",
+                  })
+                )
+                  del.mutate(name);
               }}
             >
               <X className="h-4 w-4" />

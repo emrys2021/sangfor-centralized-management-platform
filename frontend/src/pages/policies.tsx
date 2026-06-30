@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { CenteredSpinner, EmptyState, PageHeader, Spinner } from "@/components/common";
+import { useConfirm } from "@/components/confirm-dialog";
 import { DataTable } from "@/components/data-table";
 import { NoInstance } from "@/components/no-instance";
 import { PolicyDialog } from "@/components/policy-dialog";
@@ -20,6 +21,7 @@ import { cn } from "@/lib/utils";
 export function PoliciesPage() {
   const { instanceId } = useCurrentInstance();
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogMode, setDialogMode] = useState<"create" | "edit">("create");
   const [editDetail, setEditDetail] = useState<PolicyDetail | null>(null);
@@ -267,9 +269,17 @@ export function PoliciesPage() {
               title="删除"
               className="text-destructive transition-opacity hover:opacity-70 disabled:opacity-40"
               disabled={del.isPending}
-              onClick={(e) => {
+              onClick={async (e) => {
                 e.stopPropagation();
-                if (confirm(`确认删除策略「${name}」？将真实写入设备，且不可撤销。`)) del.mutate(name);
+                if (
+                  await confirm({
+                    title: "删除访问权限策略",
+                    description: `确认删除策略「${name}」？将真实写入设备，且不可撤销。`,
+                    variant: "destructive",
+                    confirmText: "删除",
+                  })
+                )
+                  del.mutate(name);
               }}
             >
               <Trash2 className="h-4 w-4" />

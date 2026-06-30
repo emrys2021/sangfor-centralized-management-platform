@@ -15,7 +15,9 @@ import type {
   PolicyApplicationUpdate,
   PolicyCreateInput,
   PolicyDetail,
+  BatchSyncResult,
   PolicyList,
+  SearchResult,
   SyncApplyResult,
   SyncDiffResult,
   UrlGroupContent,
@@ -178,6 +180,27 @@ export const syncApi = {
     push_all: boolean;
     dry_run: boolean;
   }) => http.post<SyncApplyResult>("/sync/apply", body).then((r) => r.data),
+  // 批量同步整类对象；mirror=true 时删除目标多余对象。建索引/逐条写较慢，放宽超时。
+  batch: (body: {
+    object_type: ObjectType;
+    source_instance_id: number;
+    target_instance_ids: number[];
+    push_all: boolean;
+    mirror: boolean;
+    dry_run: boolean;
+  }) => http.post<BatchSyncResult>("/sync/batch", body, { timeout: 300000 }).then((r) => r.data),
+};
+
+// ---- 全局搜索 ----
+export const searchApi = {
+  // 按域名 / IP 反查引用它的自定义应用与 URL 库。首次/refresh 建索引较慢，放宽超时。
+  query: (instanceId: number, q: string, refresh = false) =>
+    http
+      .get<SearchResult>(`/instances/${instanceId}/search`, {
+        timeout: 300000,
+        params: { q, refresh },
+      })
+      .then((r) => r.data),
 };
 
 // ---- 审计 ----

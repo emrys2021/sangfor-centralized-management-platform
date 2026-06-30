@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { Spinner } from "@/components/common";
+import { useConfirm } from "@/components/confirm-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -39,14 +40,33 @@ export const emptyCustomRuleForm: CustomRuleForm = {
   domain: "",
 };
 
-/** 左标签 + 右内容的一行（对齐原生对话框）。 */
-function Row({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
+/** 左标签 + 右内容的一行（对齐原生对话框）。``required`` 标红星，``error`` 显示字段级错误。 */
+function Row({
+  label,
+  children,
+  hint,
+  required,
+  error,
+}: {
+  label: string;
+  children: React.ReactNode;
+  hint?: string;
+  required?: boolean;
+  error?: string;
+}) {
   return (
     <div className="grid grid-cols-[88px_1fr] items-start gap-3 py-1.5">
-      <Label className="pt-2 text-right text-xs text-muted-foreground">{label}</Label>
+      <Label className="pt-2 text-right text-xs text-muted-foreground">
+        {label}
+        {required && <span className="text-destructive"> *</span>}
+      </Label>
       <div className="space-y-1">
         {children}
-        {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
+        {error ? (
+          <p className="text-[11px] text-destructive">{error}</p>
+        ) : (
+          hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>
+        )}
       </div>
     </div>
   );
@@ -108,16 +128,19 @@ export function CustomRuleFormDialog({
   initial: CustomRuleForm;
   onDone: (result: WriteResult) => void;
 }) {
+  const confirm = useConfirm();
   const [form, setForm] = useState<CustomRuleForm>(initial);
   // 新增(add)/编辑(modify) 报文均已抓包确认，可实际写入；默认仍为安全预览。
   const [realSubmit, setRealSubmit] = useState(false);
   const [showErrors, setShowErrors] = useState(false);
+  const [touched, setTouched] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (open) {
       setForm(initial);
       setRealSubmit(false);
       setShowErrors(false);
+      setTouched(new Set());
     }
   }, [open, initial]);
 
@@ -126,18 +149,29 @@ export function CustomRuleFormDialog({
 
   const dryRun = !realSubmit;
 
-  // 与 AC 一致的表单校验
-  const errors = useMemo(() => {
-    const list: string[] = [];
-    if (!form.rulename.trim()) list.push("应用基本信息 → 规则名称：不允许为空");
-    if (!form.apptype.trim()) list.push("应用基本信息 → 应用类型：不允许为空");
-    if (!form.appname.trim()) list.push("应用基本信息 → 应用名称：不允许为空");
-    if (form.port_mode === "specified" && !form.port_range.trim())
-      list.push("数据包特征 → 指定端口或范围：端口或范围为必输项");
-    if (form.ip_mode === "specified" && !form.ip_range.trim())
-      list.push("数据包特征 → 指定IP或范围：IP或范围为必输项");
-    return list;
+  // 字段级校验（与 AC 一致）：字段 → 短提示
+  const FIELD_LABELS: Record<string, string> = {
+    rulename: "应用基本信息 → 规则名称",
+    apptype: "应用基本信息 → 应用类型",
+    appname: "应用基本信息 → 应用名称",
+    port_range: "数据包特征 → 指定端口或范围",
+    ip_range: "数据包特征 → 指定IP或范围",
+  };
+  const fieldErrors = useMemo(() => {
+    const e: Record<string, string> = {};
+    if (!form.rulename.trim()) e.rulename = "不允许为空";
+    if (!form.apptype.trim()) e.apptype = "不允许为空";
+    if (!form.appname.trim()) e.appname = "不允许为空";
+    if (form.port_mode === "specified" && !form.port_range.trim()) e.port_range = "端口或范围为必输项";
+    if (form.ip_mode === "specified" && !form.ip_range.trim()) e.ip_range = "IP或范围为必输项";
+    return e;
   }, [form]);
+  // 字段已触碰或提交过才显示该字段错误（避免一打开就满屏红）
+  const errFor = (field: string) => ((showErrors || touched.has(field)) ? fieldErrors[field] : undefined);
+  const invalid = (field: string) =>
+    errFor(field) ? "border-destructive focus-visible:ring-destructive" : "";
+  const blur = (field: string) => () => setTouched((s) => new Set(s).add(field));
+  const errors = Object.entries(fieldErrors).map(([f, m]) => `${FIELD_LABELS[f]}：${m}`);
 
   // 协议下拉：若当前值不在预设里，补一个动态项以保证往返一致
   const protocolOptions = PROTOCOL_OPTIONS.some((o) => o.value === form.protocol)
@@ -158,15 +192,19 @@ export function CustomRuleFormDialog({
     onError: (e: any) => toast.error(e?.response?.data?.detail ?? "提交失败"),
   });
 
-  function handleSubmit() {
+  async function handleSubmit() {
     setShowErrors(true);
-    if (errors.length) return;
+    if (Object.keys(fieldErrors).length) return;
     // AC 提示：所有端口 + 所有IP 会匹配全部流量，提交前二次确认
     if (form.port_mode === "all" && form.ip_mode === "all") {
-      const ok = window.confirm(
-        "当前自定义应用选择了「所有端口、所有IP」，所有数据都将匹配此应用而无法匹配其他内置应用；" +
-          "若策略拒绝此自定义应用，可能造成网络无法访问。确认提交？"
-      );
+      const ok = await confirm({
+        title: "将匹配全部流量",
+        description:
+          "当前自定义应用选择了「所有端口、所有 IP」，所有数据都将匹配此应用而无法匹配其他内置应用；" +
+          "若策略拒绝此自定义应用，可能造成网络无法访问。确认提交？",
+        variant: "destructive",
+        confirmText: "确认提交",
+      });
       if (!ok) return;
     }
     submit.mutate();
@@ -182,7 +220,7 @@ export function CustomRuleFormDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="min-h-0 flex-1 space-y-3 overflow-auto pr-1">
+        <div className="min-h-0 flex-1 space-y-3 overflow-auto px-1">
           <div className="flex items-center gap-2">
             <Switch checked={form.status} onCheckedChange={(v) => set("status", v)} id="cr-status" />
             <Label htmlFor="cr-status" className="text-sm">
@@ -191,31 +229,43 @@ export function CustomRuleFormDialog({
           </div>
 
           <Section title="应用基本信息">
-            <Row label="规则名称">
+            <Row label="规则名称" required error={mode === "edit" ? undefined : errFor("rulename")}>
               <Input
                 value={form.rulename}
                 disabled={mode === "edit"}
                 onChange={(e) => set("rulename", e.target.value)}
+                onBlur={blur("rulename")}
+                className={mode === "edit" ? "" : invalid("rulename")}
                 placeholder="必填，唯一"
               />
             </Row>
             <Row label="描述信息">
               <Input value={form.depict} onChange={(e) => set("depict", e.target.value)} />
             </Row>
-            <Row label="应用类型">
+            <Row label="应用类型" required error={errFor("apptype")}>
               <div className="flex items-center gap-2">
                 <span className="shrink-0 rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground">
                   自定义应用_
                 </span>
-                <Input value={form.apptype} onChange={(e) => set("apptype", e.target.value)} />
+                <Input
+                  value={form.apptype}
+                  onChange={(e) => set("apptype", e.target.value)}
+                  onBlur={blur("apptype")}
+                  className={invalid("apptype")}
+                />
               </div>
             </Row>
-            <Row label="应用名称">
+            <Row label="应用名称" required error={errFor("appname")}>
               <div className="flex items-center gap-2">
                 <span className="shrink-0 rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground">
                   自定义应用_
                 </span>
-                <Input value={form.appname} onChange={(e) => set("appname", e.target.value)} />
+                <Input
+                  value={form.appname}
+                  onChange={(e) => set("appname", e.target.value)}
+                  onBlur={blur("appname")}
+                  className={invalid("appname")}
+                />
               </div>
             </Row>
           </Section>
@@ -245,7 +295,11 @@ export function CustomRuleFormDialog({
                 className="w-44"
               />
             </Row>
-            <Row label="目标端口">
+            <Row
+              label="目标端口"
+              required={form.port_mode === "specified"}
+              error={errFor("port_range")}
+            >
               <Segmented
                 value={form.port_mode}
                 onChange={(v) => set("port_mode", v)}
@@ -256,14 +310,15 @@ export function CustomRuleFormDialog({
               />
               {form.port_mode === "specified" && (
                 <Input
-                  className="mt-2"
+                  className={cn("mt-2", invalid("port_range"))}
                   value={form.port_range}
                   onChange={(e) => set("port_range", e.target.value)}
+                  onBlur={blur("port_range")}
                   placeholder="如 80,443,1000-2000"
                 />
               )}
             </Row>
-            <Row label="IP地址">
+            <Row label="IP地址" required={form.ip_mode === "specified"} error={errFor("ip_range")}>
               <Segmented
                 value={form.ip_mode}
                 onChange={(v) => set("ip_mode", v)}
@@ -274,9 +329,10 @@ export function CustomRuleFormDialog({
               />
               {form.ip_mode === "specified" && (
                 <Textarea
-                  className="mt-2 font-mono text-xs"
+                  className={cn("mt-2 font-mono text-xs", invalid("ip_range"))}
                   value={form.ip_range}
                   onChange={(e) => set("ip_range", e.target.value)}
+                  onBlur={blur("ip_range")}
                   placeholder={"192.168.0.1\n2001::1\n192.168.0.1-192.168.0.100"}
                 />
               )}
