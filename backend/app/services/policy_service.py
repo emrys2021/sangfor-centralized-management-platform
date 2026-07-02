@@ -137,6 +137,10 @@ def delete_policy(db: Session, user: CurrentUser, instance: Instance, policy_nam
     web = session_pool.get_web_client(instance)
     result = web.delete_policy(policy_name, dry_run=dry_run)
     _audit(db, user, instance, "dry_run" if dry_run else "delete", policy_name, result, message="删除策略")
+    if not dry_run:
+        # 与 create/update 及自定义应用/URL 删除一致：真实删除后失效该实例的分析/对比/搜索/引用缓存，
+        # 否则桑基图、全量对比、全局搜索会残留已删策略（最多留一个 TTL）。
+        analysis_cache.invalidate_instance(instance.id)
     return result
 
 
@@ -152,7 +156,7 @@ def move_policy(db: Session, user: CurrentUser, instance: Instance, policy_name:
 def set_policies_status(
     db: Session, user: CurrentUser, instance: Instance, names: list[str], enabled: bool, dry_run: bool
 ):
-    """批量启用 / 禁用策略。启用状态不影响数据校验的关系内容，无需失效分析缓存。"""
+    """批量启用 / 禁用策略。"""
     web = session_pool.get_web_client(instance)
     result = web.set_policies_status(names, enabled=enabled, dry_run=dry_run)
     action = "dry_run" if dry_run else ("enable" if enabled else "disable")
@@ -160,6 +164,9 @@ def set_policies_status(
         db, user, instance, action, ",".join(names), result,
         message=f"{'启用' if enabled else '禁用'} {len(names)} 条策略",
     )
+    if not dry_run:
+        # 启停状态已纳入策略对比核心字段（enable）与引用校验结果（status），真实写入后需失效缓存
+        analysis_cache.invalidate_instance(instance.id)
     return result
 
 

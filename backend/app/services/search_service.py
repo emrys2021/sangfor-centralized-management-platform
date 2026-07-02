@@ -26,6 +26,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+from app.config import settings
 from app.db.models import Instance
 from app.sangfor import session_pool
 from app.services import customrule_form
@@ -159,7 +160,7 @@ def _build_index(instance: Instance) -> dict:
     apps_idx: list[dict] = []
     urls_idx: list[dict] = []
     if tasks:
-        max_workers = min(8, max(1, len(tasks)))
+        max_workers = min(settings.fetch_concurrency, max(1, len(tasks)))
         with ThreadPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(web,)) as pool:
             for kind, data, error in pool.map(fetch, tasks):
                 if error or data is None:

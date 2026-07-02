@@ -14,6 +14,8 @@ import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
+from app.config import settings
+
 # 线程池中每个 worker 独占的 Web 客户端克隆（独立 requests.Session）。
 _worker_tls = threading.local()
 
@@ -157,7 +159,7 @@ def _build_policy_relations(
     app_link_map: dict[tuple[str, str], dict] = {}
     url_link_map: dict[tuple[str, str], dict] = {}
     if access_policies:
-        workers = min(8, max(1, len(access_policies)))
+        workers = min(settings.fetch_concurrency, max(1, len(access_policies)))
         with ThreadPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(web,)) as pool:
             results = list(pool.map(fetch_policy, access_policies))
         for pname, detail, err in results:
@@ -211,7 +213,7 @@ def _build_url_summaries(web, url_nodes: list[dict], errors: list[str]) -> list[
 
     def fetch_url_group(name: str):
         try:
-            urls = list(dict.fromkeys(web.get_url_group_content(name)))
+            urls = list(dict.fromkeys(_worker_tls.client.get_url_group_content(name)))
             return {"name": name, "url_count": len(urls), "urls": urls}, None
         except Exception as exc:  # noqa: BLE001
             return {"name": name, "url_count": 0, "urls": []}, str(exc)
@@ -219,8 +221,9 @@ def _build_url_summaries(web, url_nodes: list[dict], errors: list[str]) -> list[
     if not names:
         return []
 
-    workers = min(8, max(1, len(names)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    workers = min(settings.fetch_concurrency, max(1, len(names)))
+    # 每个 worker 用 web.clone_session() 的独立 session，规避 requests.Session 非线程安全。
+    with ThreadPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(web,)) as pool:
         results = list(pool.map(fetch_url_group, names))
 
     summaries = []

@@ -16,10 +16,12 @@
 约束：
 - **访问权限策略的跨实例同步**（见 :mod:`app.services.policy_sync`）：apply 时预读源完整
   策略，再据目标设备的应用树（``listAppTree``）按引用路径重映射各引用的 crc；目标缺失的
-  **自定义**被引用对象（应用 / URL 库）会复用已确认写接口先建到目标，**内置**缺失则只在
-  ``warnings`` 列出、无法自动创建（real-write 遇内置缺失会整体阻止、不写）。落盘走已验证路径：
-  目标有同名策略 → ``modify_policy_application``（读目标底座、仅替换规则引用）；无 → ``create_policy``
-  （``opr=add``）。适用用户不随报文跨实例，新建后需在目标手工配置。
+  **自定义**被引用对象（应用 / URL 库）会复用已确认写接口先建到目标。若仍有**无法解析的引用**
+  （**内置**对象在目标缺失、或自定义引用**创建失败**），丢弃它会写出与源不等价（**降级**）的策略——
+  故 real-write **默认拒绝**（``refused``、``warnings`` 列出这些引用；内置缺失在创建任何对象前即拒绝，
+  自定义创建失败则可能已建部分对象、保留在目标），需 ``allow_degrade=True`` 才写入降级版本。落盘走
+  已验证路径：目标有同名策略 → ``modify_policy_application``（读目标底座、仅替换规则引用）；无 →
+  ``create_policy``（``opr=add``）。适用用户不随报文跨实例，新建后需在目标手工配置。
 - 读取目标快照区分 ``found`` / ``not_found`` / ``error``：读取/解析失败（``error``）不会被
   当作「对象不存在」，apply 阶段直接跳过该目标，避免把读失败误判为「需新增」而误写。
 """
@@ -56,6 +58,64 @@ def _is_not_found(message: str) -> bool:
     return any(h in msg for h in _NOT_FOUND_HINTS)
 
 
+def build_policy_snapshot(name: str, detail: dict) -> dict:
+    """策略规范化快照，**只覆盖「应用控制 / 端口控制 / 代理控制」三段**（其余段——Web 关键字/
+    文件类型过滤、邮件过滤、QQ、SaaS 等——不纳入对比，故不在快照里）。
+
+    - 顶层 ``enable``：整条策略启用/禁用。
+    - 应用控制：``application_include`` 段开关 + ``rules``（每条含**动作** action 放行/拒绝、
+      引用应用 path、URL 名；去掉 crc/rule_id 噪音，rule_id 仅留 ``name`` 供前端提示）。
+    - 端口控制：``network_include`` + ``network_rules``（目的 IP 对象 dip / 服务 service /
+      动作 action / 时间 time；设备侧无 crc/rule_id，可直接对位比）。
+    - 代理控制：``proxy_include`` + ``proxy``（http/sock/errorproto 三个代理类型的开关）。
+
+    对比方（:mod:`app.services.compare_service`）约定：段开关为 False 时**不比该段内容**
+    （应用控制没启用就不比规则）。
+    """
+    appctrl = detail.get("appctrl", {}) or {}
+    app_rules = [
+        {
+            "name": r.get("name", ""),
+            "action": r.get("action", "unknown"),
+            "apps": sorted(
+                ({"path": a["path"], "custom": bool(a.get("custom"))} for a in r.get("apps", [])),
+                key=lambda x: x["path"],
+            ),
+            "urls": sorted(
+                ({"name": u["name"], "custom": bool(u.get("custom"))} for u in r.get("urls", [])),
+                key=lambda x: x["name"],
+            ),
+        }
+        for r in detail.get("rules", [])
+    ]
+    net = appctrl.get("network", {}) or {}
+    network_rules = [
+        {
+            "dip": str(x.get("dip", "")),
+            "service": str(x.get("service", "")),
+            "action": x.get("action"),
+            "time": str(x.get("time", "")),
+        }
+        for x in (net.get("data") or [])
+    ]
+    proxy = appctrl.get("proxy", {}) or {}
+    proxy_norm = {
+        "http": bool((proxy.get("http") or {}).get("enable")),
+        "sock": bool((proxy.get("sock") or {}).get("enable")),
+        "errorproto": bool((proxy.get("errorproto") or {}).get("enable")),
+    }
+    return {
+        "policy_name": name,
+        "enable": bool(detail.get("enable", True)),
+        "application_include": bool(detail.get("application_include")),
+        "rules": app_rules,
+        "network_include": bool(net.get("include")),
+        "network_rules": network_rules,
+        "proxy_include": bool(proxy.get("include")),
+        "proxy": proxy_norm,
+    }
+
+
 def _build_snapshot(web: SangforWebClient, object_type: str, name: str) -> tuple[str, dict, str]:
     """返回 ``(status, 快照, 错误信息)``，``status`` ∈ ``found`` / ``not_found`` / ``error``。
 
@@ -82,22 +142,8 @@ def _build_snapshot(web: SangforWebClient, object_type: str, name: str) -> tuple
             }, ""
         if object_type == "policy":
             detail = web.get_policy_detail(name)
-            # 保留 custom 标记，供前端把引用分「内置/自定义 应用、内置/自定义 URL 库」展示
-            rules = [
-                {
-                    "name": r["name"],
-                    "apps": sorted(
-                        ({"path": a["path"], "custom": bool(a.get("custom"))} for a in r["apps"]),
-                        key=lambda x: x["path"],
-                    ),
-                    "urls": sorted(
-                        ({"name": u["name"], "custom": bool(u.get("custom"))} for u in r["urls"]),
-                        key=lambda x: x["name"],
-                    ),
-                }
-                for r in detail.get("rules", [])
-            ]
-            return "found", {"policy_name": name, "rules": rules}, ""
+            # 覆盖 应用控制/端口控制/代理控制 三段 + 启用状态（其余段不纳入对比）
+            return "found", build_policy_snapshot(name, detail), ""
         return "error", {}, f"未知对象类型: {object_type}"
     except SangforWebError as exc:
         msg = str(exc)
@@ -194,6 +240,7 @@ def _write_to_target(
     source_custom_apps: set[str] | None = None,
     source_custom_urls: set[str] | None = None,
     policy_app_index: dict | None = None,
+    allow_degrade: bool = False,
 ) -> dict:
     """根据对象是否已存在选择 create / update。三类对象均支持真实写入。
 
@@ -232,6 +279,7 @@ def _write_to_target(
             source_custom_apps=source_custom_apps or set(),
             source_custom_urls=source_custom_urls or set(),
             app_index=policy_app_index,
+            allow_degrade=allow_degrade,
         )
     raise ValueError(f"未知对象类型: {object_type}")
 
@@ -246,6 +294,7 @@ def apply_sync(
     target_instance_ids: list[int],
     push_all: bool,
     dry_run: bool,
+    allow_degrade: bool = False,
 ) -> SyncApplyResult:
     source_inst = instance_service.get_instance(db, source_instance_id)
     if not source_inst:
@@ -308,34 +357,50 @@ def apply_sync(
                 source_policy_detail=source_policy_detail,
                 source_custom_apps=source_custom_apps,
                 source_custom_urls=source_custom_urls,
+                allow_degrade=allow_degrade,
             )
             # policy 路径不抛异常、以 outcome["ok"] 表示成败；customrule/url 无 ok 键默认成功
             ok = bool(outcome.get("ok", True))
             committed = ok and not outcome.get("dry_run", dry_run)
-            if committed:
-                invalidate_instance(tid)  # 真实写入后让目标实例的分析缓存失效
+            degraded = bool(outcome.get("degraded"))
+            refused = bool(outcome.get("refused"))
             verb = "更新" if exists else "新增"
+            # 是否真实写入过设备（含"已建部分对象但策略被拒绝"的情况）——决定被创建对象用「已」还是「将」
+            is_real = not outcome.get("dry_run", dry_run)
             missing = outcome.get("missing") or []
             created = outcome.get("created") or []
             details = outcome.get("details") or []
-            # 策略同步附注：自动创建的自定义引用对象 + 被跳过的内置缺失引用
+            # 失效目标缓存：真实写入策略成功(committed)，或虽被拒/失败但已在目标建了部分自定义引用
+            # 对象(created 非空)——两种情况目标设备都已变更，否则引用校验/搜索/对比会读旧缓存、看不到新建对象。
+            if committed or (is_real and created):
+                invalidate_instance(tid)
+            # 策略同步附注：自定义引用对象的创建/更新 + 被丢弃的引用
             note = ""
             if created:
-                note += f"；{'将' if not committed else ''}创建/更新 {len(created)} 个自定义引用对象"
-            if missing:
-                note += f"；{len(missing)} 个内置引用目标缺失、无法创建，已跳过这些引用"
-            if not ok:
+                # 真实写入时这些对象**已经**建/改进设备（即便策略最终被拒绝，它们仍保留在目标）
+                note += f"；{'已' if is_real else '将'}创建/更新 {len(created)} 个自定义引用对象"
+                if refused and is_real:
+                    note += "（保留在目标）"
+            if missing and not refused:
+                # 仅"降级写入/预览"才是真的把引用跳过并写了策略；被拒绝时策略根本没写、不存在"已跳过"
+                note += f"；{len(missing)} 个引用目标缺失或创建失败、已跳过（策略与源不等价）"
+            if refused:
+                # 乙：默认拒绝——**策略未写入**（但上面 note 会说明已建的自定义对象保留在目标）
+                base_msg = f"已拒绝写入策略（缺 {len(missing)} 个引用无法解析）：勾选「允许降级同步」后可写入降级版本"
+            elif not ok:
                 base_msg = f"同步失败（{verb}）"
             elif committed:
-                base_msg = f"已{verb}"
+                base_msg = f"已{verb}（降级：跳过 {len(missing)} 个引用）" if degraded else f"已{verb}"
             else:
-                base_msg = f"dry_run 预览（将{verb}）"
+                base_msg = f"dry_run 预览（将{verb}{'·降级' if degraded else ''}）"
             results.append(
                 TargetApplyResult(
                     instance_id=tid,
                     instance_name=target_inst.name,
                     success=ok,
                     dry_run=outcome.get("dry_run", dry_run),
+                    degraded=degraded,
+                    refused=refused,
                     message=base_msg + note,
                     payload=outcome.get("payload"),
                     warnings=list(missing),
@@ -408,6 +473,7 @@ def batch_sync(
     push_all: bool,
     mirror: bool,
     dry_run: bool,
+    allow_degrade: bool = False,
 ) -> BatchSyncResult:
     """把源实例某类对象的**全部**同步到目标：逐对象 upsert；``mirror`` 时删除目标多余对象。
 
@@ -489,7 +555,7 @@ def batch_sync(
                         web, object_type, {}, exists, dry_run,
                         source_web=source_web, source_policy_detail=detail,
                         source_custom_apps=source_custom_apps, source_custom_urls=source_custom_urls,
-                        policy_app_index=policy_index,
+                        policy_app_index=policy_index, allow_degrade=allow_degrade,
                     )
                     op_ok = outcome.get("ok", True)
                 else:
@@ -501,13 +567,20 @@ def batch_sync(
                         continue
                     outcome = _write_to_target(web, object_type, dict(snap), exists, dry_run)
                     op_ok = True
-                invalidate_instance(tid)
-                if not op_ok:  # 策略写失败（ok=False，不抛）
+                if not op_ok:  # 策略写失败或被拒绝降级（ok=False，不抛）
+                    # 被拒/失败但已在目标建了部分自定义引用对象：目标已变更，仍要失效缓存
+                    if outcome.get("created"):
+                        invalidate_instance(tid)
                     msg = "；".join(outcome.get("details", [])) or "写入失败"
                     failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=msg))
                 else:
+                    invalidate_instance(tid)  # 真实写入后失效目标分析缓存
                     (updated if exists else created).append(name)
-                    details.append(BatchObjectResult(name=name, action="update" if exists else "create", ok=True))
+                    miss = len(outcome.get("missing") or [])
+                    details.append(BatchObjectResult(
+                        name=name, action="update" if exists else "create", ok=True,
+                        message=f"降级：跳过 {miss} 个引用（与源不等价）" if outcome.get("degraded") else "",
+                    ))
             except Exception as exc:  # noqa: BLE001  单对象失败不拖垮整体
                 failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=str(exc)))
 

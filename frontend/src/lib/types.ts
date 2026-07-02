@@ -281,9 +281,13 @@ export interface TargetApplyResult {
   instance_name: string;
   success: boolean;
   dry_run: boolean;
+  /** 策略同步：因丢弃了目标缺失的引用，写出的策略与源不等价（降级）。 */
+  degraded: boolean;
+  /** 策略同步：因缺引用且未允许降级而被拒绝、未写策略（安全拦截，非失败）；已建的自定义引用对象仍保留在目标。 */
+  refused: boolean;
   message: string;
   payload: Record<string, unknown> | null;
-  /** 跨实例策略同步：目标缺失的内置引用路径（无法自动创建、已跳过）。 */
+  /** 跨实例策略同步：目标上无法解析的引用路径（内置对象缺失、或自定义引用创建失败）。降级写入时被跳过，默认（拒绝）时策略未写。 */
   warnings: string[];
   /** 逐步结果日志（建自定义引用、写策略各请求的成功/失败与详情）。 */
   details: string[];
@@ -322,6 +326,43 @@ export interface BatchSyncResult {
   source_count: number;
   mirror: boolean;
   targets: BatchTargetResult[];
+}
+
+// ---- 全量对比（只读） ----
+export type CompareStatus = "source_only" | "target_only" | "both" | "identical" | "different" | "error";
+
+export interface CompareItem {
+  name: string;
+  status: CompareStatus;
+  diffs: FieldDiff[];
+  source_snapshot: Record<string, unknown> | null;
+  target_snapshot: Record<string, unknown> | null;
+  error: string;
+}
+
+export interface CompareTargetResult {
+  instance_id: number;
+  instance_name: string;
+  error: string;
+  source_only: number;
+  target_only: number;
+  /** 仅名单对比：两边都有的数量（内容对比时恒为 0，拆入 identical/different）。 */
+  both: number;
+  identical: number;
+  different: number;
+  error_count: number;
+  items: CompareItem[];
+}
+
+export interface BatchCompareResult {
+  object_type: ObjectType;
+  source_instance_id: number;
+  source_count: number;
+  /** 本次是否为「仅名单」对比。 */
+  names_only: boolean;
+  source_cached: boolean;
+  source_cache_age_seconds: number;
+  targets: CompareTargetResult[];
 }
 
 // ---- 全局搜索 ----
@@ -412,6 +453,27 @@ export interface CustomRuleAnalysis {
   /** 本次结果是否来自服务端缓存 */
   cached?: boolean;
   /** 缓存已存在的秒数（cached 为 true 时有意义） */
+  cache_age_seconds?: number | null;
+}
+
+// ---- 策略引用校验 ----
+export interface PolicyUsageItem {
+  name: string;
+  depict: string;
+  founder: string;
+  status: boolean;
+  order: number;
+  user_count: number; // 引用此策略的用户数（0 = 无人使用）
+  used: boolean;
+}
+
+export interface PolicyUsageResult {
+  policies: PolicyUsageItem[];
+  total_policies: number;
+  unused_count: number;
+  total_users: number;
+  errors: string[];
+  cached?: boolean;
   cache_age_seconds?: number | null;
 }
 

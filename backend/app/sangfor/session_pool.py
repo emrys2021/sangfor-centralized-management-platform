@@ -12,13 +12,21 @@ from __future__ import annotations
 import threading
 
 from app.config import settings
-from app.core.security import decrypt
+from app.core.security import CredentialDecryptError, decrypt
 from app.db.models import Instance
 from app.sangfor.api_client import SangforApiClient
-from app.sangfor.web_client import SangforWebClient
+from app.sangfor.web_client import SangforWebClient, SangforWebError
 
 _lock = threading.Lock()
 _web_clients: dict[int, SangforWebClient] = {}
+
+
+def _decrypt_or_raise(token: str | None, *, field: str) -> str:
+    """解密凭据；主密钥不匹配/密文损坏时转为 :class:`SangforWebError`（路由层统一处理）。"""
+    try:
+        return decrypt(token)
+    except CredentialDecryptError as exc:
+        raise SangforWebError(f"{field}{exc}") from exc
 
 
 def get_web_client(instance: Instance) -> SangforWebClient:
@@ -31,7 +39,7 @@ def get_web_client(instance: Instance) -> SangforWebClient:
                 host=instance.host,
                 port=instance.web_port,
                 user_name=instance.web_user,
-                password=decrypt(instance.web_password_enc),
+                password=_decrypt_or_raise(instance.web_password_enc, field="Web 密码："),
                 timeout=settings.request_timeout,
                 verify=settings.tls_verify,
             )
@@ -45,7 +53,7 @@ def get_api_client(instance: Instance) -> SangforApiClient:
     return SangforApiClient(
         host=instance.host,
         port=instance.api_port,
-        key=decrypt(instance.api_key_enc),
+        key=_decrypt_or_raise(instance.api_key_enc, field="API 密钥："),
         timeout=settings.request_timeout,
     )
 

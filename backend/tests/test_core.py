@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.security import decrypt, encrypt
+from app.core.security import CredentialDecryptError, decrypt, encrypt
 from app.sangfor.web_client import SangforWebClient, SangforWebError
 from app.services import customrule_form, policy_relations
 from app.services.sync_service import _diff_snapshots
@@ -19,7 +19,16 @@ def test_encrypt_roundtrip():
     assert decrypt(token) == secret
     assert encrypt("") == ""
     assert decrypt("") == ""
-    assert decrypt("not-a-valid-token") == ""
+    with pytest.raises(CredentialDecryptError):
+        decrypt("not-a-valid-token")
+
+
+def test_session_pool_wraps_decrypt_error_as_sangfor_web_error():
+    """主密钥不匹配时，session_pool 应转成 SangforWebError（路由层已知如何处理），而非静默返回空密码。"""
+    from app.sangfor import session_pool
+
+    with pytest.raises(SangforWebError, match="Web 密码"):
+        session_pool._decrypt_or_raise("not-a-valid-token", field="Web 密码：")
 
 
 def _client() -> SangforWebClient:
@@ -1236,7 +1245,7 @@ def test_ensure_referenced_objects_dedupes_by_name():
 
 
 def test_sync_policy_real_write_skips_builtin_missing():
-    """real-write 最大努力：内置缺失引用被跳过、策略照常写入，跳过项计入 missing。"""
+    """允许降级（allow_degrade=True）：内置缺失引用被跳过、策略照常写入、标 degraded，跳过项计入 missing。"""
     from app.services.policy_sync import sync_policy_to_target
 
     # 目标缺内置「Web流媒体/全部」，源详情额外引用它
@@ -1256,9 +1265,10 @@ def test_sync_policy_real_write_skips_builtin_missing():
     out = sync_policy_to_target(
         source_web=None, target_web=target, source_detail=detail,
         exists=True, dry_run=False, source_custom_apps=set(), source_custom_urls=set(),
+        allow_degrade=True,
     )
-    # 策略照常写入（最大努力），内置缺失引用被丢弃并计入 missing
-    assert out["ok"] is True
+    # 允许降级后照常写入，内置缺失引用被丢弃、标 degraded、计入 missing
+    assert out["ok"] is True and out["degraded"] is True
     assert len(target.modify_calls) == 1
     _, rules, _ = target.modify_calls[0]
     ref_paths = {r["path"] for r in rules[0]["refs"]}
@@ -1446,6 +1456,235 @@ def test_batch_sync_mirror_deletes_extra_target_objects(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# 策略同步：降级（引用缺失被丢弃）的拒绝 / 允许 / 预览
+# --------------------------------------------------------------------------- #
+
+class _DegradeTgt:
+    """目标设备替身：空应用树（引用全缺失），记录是否真的写了策略。"""
+
+    def __init__(self):
+        self.written = []
+
+    def list_app_tree(self):
+        return {"data": []}  # 空树 → 源引用在目标都解析不到
+
+    def modify_policy_application(self, name, rules, **kw):
+        self.written.append(("modify", rules))
+        return {"dry_run": kw.get("dry_run", False)}
+
+    def create_policy(self, data, dry_run=False):
+        self.written.append(("create", data))
+        return {"dry_run": dry_run}
+
+
+_DEGRADE_SRC = {
+    "policy_name": "P", "application_include": True, "enable": True, "depict": "",
+    "rules": [{"rule_id": "1", "action_bool": False,
+               "refs": [{"path": "内置/某拒绝对象", "type": "app", "crc": "9", "extra": ""}]}],
+}
+
+
+def _sync_degrade(tgt, *, dry_run, allow_degrade):
+    from app.services import policy_sync
+    return policy_sync.sync_policy_to_target(
+        None, tgt, _DEGRADE_SRC, exists=True, dry_run=dry_run,
+        source_custom_apps=set(), source_custom_urls=set(), allow_degrade=allow_degrade,
+    )
+
+
+def test_sync_policy_refuses_degrade_by_default():
+    """乙：真实写入 + 未允许降级 → 拒绝、不写设备。"""
+    tgt = _DegradeTgt()
+    out = _sync_degrade(tgt, dry_run=False, allow_degrade=False)
+    assert out["ok"] is False and out["refused"] is True and out["degraded"] is True
+    assert tgt.written == []  # 没有真的写策略
+
+
+def test_sync_policy_writes_degraded_when_allowed():
+    """允许降级 → 写入降级版本、标 degraded。"""
+    tgt = _DegradeTgt()
+    out = _sync_degrade(tgt, dry_run=False, allow_degrade=True)
+    assert out["ok"] is True and out["degraded"] is True and out["refused"] is False
+    assert len(tgt.written) == 1  # 真的写了（降级版）
+
+
+def test_sync_policy_dryrun_previews_degrade_without_refusing():
+    """dry-run 始终预览降级、不拦截。"""
+    tgt = _DegradeTgt()
+    out = _sync_degrade(tgt, dry_run=True, allow_degrade=False)
+    assert out["degraded"] is True and out["refused"] is False and out["ok"] is True
+
+
+def test_sync_policy_refuse_does_not_create_referenced_objects():
+    """codex #1 修正：真实写入被拒绝（降级未允许）时，**连可创建的自定义引用对象也不建**、不改设备。"""
+    from app.services.policy_sync import sync_policy_to_target
+
+    detail = _source_policy_detail()
+    # 额外引用一个目标缺失的**内置**对象 → 会触发降级
+    detail["rules"][0]["refs"].append({"path": "Web流媒体/全部", "type": "app", "crc": "S-1", "extra": ""})
+    # 目标空树：钉钉应用/白名单（可创建）与 Web流媒体/全部（内置、不可创建）都缺失
+    target = _FakeTargetWeb({"data": []}, has_policy=True)
+    out = sync_policy_to_target(
+        source_web=_FakeSourceWeb(), target_web=target, source_detail=detail,
+        exists=True, dry_run=False,
+        source_custom_apps={"钉钉应用"}, source_custom_urls={"钉钉白名单"}, allow_degrade=False,
+    )
+    assert out["refused"] is True and out["ok"] is False and out["created"] == []
+    # 关键：拒绝发生在创建之前——自定义引用对象没被写进设备，策略本身也没写
+    assert target.created_apps == [] and target.created_urls == []
+    assert target.updated_apps == [] and target.updated_urls == []
+    assert target.modify_calls == []
+
+
+def test_sync_policy_refuses_when_custom_ref_create_fails():
+    """codex 姊妹 bug：自定义引用**创建失败**导致引用缺失时，真实写入默认拒绝、不写出缺引用的降级策略。"""
+    from app.services.policy_sync import sync_policy_to_target
+
+    class _FailUrlCreate(_FakeTargetWeb):
+        def create_url_group(self, data, *, dry_run=True):
+            raise SangforWebError("创建 URL 库失败：设备拒绝")
+
+    # 源仅引用一个自定义 URL「钉钉白名单」；目标空树需创建，而创建会失败
+    detail = {
+        "policy_name": "外网白名单", "application_include": True, "enable": True, "depict": "",
+        "rules": [{"rule_id": "1", "name": "1", "action_bool": True,
+                   "refs": [{"path": "访问网站/钉钉白名单/网站浏览", "type": "power", "crc": "S-1", "extra": "url"}]}],
+    }
+    target = _FailUrlCreate({"data": []}, has_policy=True)
+    out = sync_policy_to_target(
+        source_web=_FakeSourceWeb(), target_web=target, source_detail=detail,
+        exists=True, dry_run=False,
+        source_custom_apps=set(), source_custom_urls={"钉钉白名单"}, allow_degrade=False,
+    )
+    assert out["refused"] is True and out["ok"] is False
+    assert target.modify_calls == []  # 创建失败 → 策略没写
+    assert any("失败" in d for d in out["details"])
+
+
+# --------------------------------------------------------------------------- #
+# 全量对比：四分类 + 策略按内容（忽略 rule_id）判定
+# --------------------------------------------------------------------------- #
+
+def _setup_compare(monkeypatch, src_index, tgt_index):
+    from app.services import compare_service
+
+    class _Inst:
+        def __init__(self, i, n):
+            self.id, self.name = i, n
+
+    insts = {1: _Inst(1, "源"), 2: _Inst(2, "目标")}
+    idx = {1: src_index, 2: tgt_index}
+    monkeypatch.setattr(compare_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    monkeypatch.setattr(compare_service, "_index", lambda inst, ot, *, force=False: (idx[inst.id], False, 0))
+    return compare_service
+
+
+def test_compare_classifies_four_buckets(monkeypatch):
+    """仅源有 / 仅目标有 / 内容一致 / 内容不一致 四类正确归位。"""
+    src_index = {"names": ["a", "b", "c"], "snaps": {
+        "a": ("found", {"name": "a", "url": "x"}, ""),
+        "b": ("found", {"name": "b", "url": "same"}, ""),
+        "c": ("found", {"name": "c", "url": "src"}, ""),
+    }}
+    tgt_index = {"names": ["b", "c", "d"], "snaps": {
+        "b": ("found", {"name": "b", "url": "same"}, ""),
+        "c": ("found", {"name": "c", "url": "tgt"}, ""),
+        "d": ("found", {"name": "d", "url": "z"}, ""),
+    }}
+    compare_service = _setup_compare(monkeypatch, src_index, tgt_index)
+    res = compare_service.compare(db=None, object_type="url", source_instance_id=1, target_instance_ids=[2])
+    t = res.targets[0]
+    assert (t.source_only, t.target_only, t.identical, t.different) == (1, 1, 1, 1)
+    by = {it.name: it.status for it in t.items}
+    assert by == {"a": "source_only", "b": "identical", "c": "different", "d": "target_only"}
+    c = next(it for it in t.items if it.name == "c")
+    assert c.source_snapshot == {"name": "c", "url": "src"} and c.diffs  # 不一致带源快照 + 字段差异
+    # identical 精简报文：不带快照
+    assert next(it for it in t.items if it.name == "b").source_snapshot is None
+
+
+def test_compare_names_only_three_buckets(monkeypatch):
+    """仅名单对比：只按名字分「仅源有 / 仅目标有 / 两边都有」，不拉详情。"""
+    from app.services import compare_service
+
+    class _Inst:
+        def __init__(self, i, n):
+            self.id, self.name = i, n
+
+    insts = {1: _Inst(1, "源"), 2: _Inst(2, "目标")}
+    monkeypatch.setattr(compare_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    names = {1: ["a", "b", "c"], 2: ["b", "c", "d"]}
+    monkeypatch.setattr(compare_service, "_list_names", lambda inst, ot: names[inst.id])
+    # 若误走内容路径会调用 _index（拉详情），这里让它报错以确保没走
+    monkeypatch.setattr(compare_service, "_index", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不应拉详情")))
+
+    res = compare_service.compare(
+        db=None, object_type="url", source_instance_id=1, target_instance_ids=[2], names_only=True
+    )
+    assert res.names_only is True
+    t = res.targets[0]
+    assert (t.source_only, t.target_only, t.both) == (1, 1, 2)
+    by = {it.name: it.status for it in t.items}
+    assert by == {"a": "source_only", "b": "both", "c": "both", "d": "target_only"}
+
+
+def _pol(name, rules, *, enable=True, app_inc=True, net_inc=False, net_rules=None, proxy_inc=False, proxy=None):
+    """构造一条策略快照（默认只启用应用控制），供对比测试用。"""
+    return {
+        "policy_name": name, "enable": enable, "application_include": app_inc, "rules": rules,
+        "network_include": net_inc, "network_rules": net_rules or [],
+        "proxy_include": proxy_inc, "proxy": proxy or {"http": False, "sock": False, "errorproto": False},
+    }
+
+
+def test_compare_policy_uses_content_not_rule_id(monkeypatch):
+    """策略：rule_id 跨实例不同但引用应用/URL 相同 → 判「一致」；引用不同 → 判「不一致」。"""
+    src_index = {"names": ["P", "Q"], "snaps": {
+        "P": ("found", _pol("P", [{"name": "111", "action": "allow", "apps": [{"path": "A"}], "urls": []}]), ""),
+        "Q": ("found", _pol("Q", [{"name": "1", "action": "allow", "apps": [{"path": "A"}], "urls": []}]), ""),
+    }}
+    tgt_index = {"names": ["P", "Q"], "snaps": {
+        "P": ("found", _pol("P", [{"name": "999", "action": "allow", "apps": [{"path": "A"}], "urls": []}]), ""),
+        "Q": ("found", _pol("Q", [{"name": "2", "action": "allow", "apps": [{"path": "B"}], "urls": []}]), ""),
+    }}
+    compare_service = _setup_compare(monkeypatch, src_index, tgt_index)
+    res = compare_service.compare(db=None, object_type="policy", source_instance_id=1, target_instance_ids=[2])
+    by = {it.name: it for it in res.targets[0].items}
+    assert by["P"].status == "identical"  # rule_id 不同但内容相同
+    assert by["Q"].status == "different"  # 引用应用 A vs B
+
+
+def test_compare_policy_detects_action_enable_network(monkeypatch):
+    """扩展对比：同引用但动作相反 / 被禁用 / 端口控制不同 → 都判「不一致」。"""
+    base = [{"name": "1", "action": "allow", "apps": [{"path": "A"}], "urls": []}]
+    src_index = {"names": ["ACT", "EN", "NET", "SAME"], "snaps": {
+        "ACT": ("found", _pol("ACT", base), ""),
+        "EN": ("found", _pol("EN", base), ""),
+        "NET": ("found", _pol("NET", base, net_inc=True,
+                              net_rules=[{"dip": "黑名单", "service": "All", "action": 0, "time": "全天"}]), ""),
+        "SAME": ("found", _pol("SAME", base), ""),
+    }}
+    tgt_index = {"names": ["ACT", "EN", "NET", "SAME"], "snaps": {
+        # 同引用但动作 allow→deny
+        "ACT": ("found", _pol("ACT", [{"name": "9", "action": "deny", "apps": [{"path": "A"}], "urls": []}]), ""),
+        # 同引用但整条被禁用
+        "EN": ("found", _pol("EN", base, enable=False), ""),
+        # 端口控制规则不同
+        "NET": ("found", _pol("NET", base, net_inc=True,
+                              net_rules=[{"dip": "白名单", "service": "All", "action": 1, "time": "全天"}]), ""),
+        # 完全一致（仅 rule_id 不同）
+        "SAME": ("found", _pol("SAME", [{"name": "77", "action": "allow", "apps": [{"path": "A"}], "urls": []}]), ""),
+    }}
+    compare_service = _setup_compare(monkeypatch, src_index, tgt_index)
+    res = compare_service.compare(db=None, object_type="policy", source_instance_id=1, target_instance_ids=[2])
+    by = {it.name: it.status for it in res.targets[0].items}
+    assert by["ACT"] == "different"   # 动作相反
+    assert by["EN"] == "different"    # 启用状态不同
+    assert by["NET"] == "different"   # 端口控制不同
+    assert by["SAME"] == "identical"  # 真一致
+
+
+# --------------------------------------------------------------------------- #
 # 旧固件（acnetpolicy.cgi）策略写：ssl 段补齐 + 白名单
 # --------------------------------------------------------------------------- #
 
@@ -1481,4 +1720,152 @@ def test_acnetpolicy_writes_are_confirmed():
 
     assert ("/cgi-bin/acnetpolicy.cgi", "add") in CONFIRMED_WRITES
     assert ("/cgi-bin/acnetpolicy.cgi", "modify") in CONFIRMED_WRITES
+
+
+# --------------------------------------------------------------------------- #
+# 组织 / 用户 CGI + 策略引用校验
+# --------------------------------------------------------------------------- #
+
+def test_list_org_tree_flattens_all_nodes(monkeypatch):
+    """listorgtree 嵌套树展平为所有组节点（含根、子组）。"""
+    c = _client()
+    tree = {
+        "success": True,
+        "data": {
+            "text": "/", "id": "root", "leaf": False,
+            "children": [
+                {"text": "非个人电脑", "id": "g1", "leaf": False, "children": [
+                    {"text": "服务器", "id": "g1a", "leaf": True},
+                ]},
+                {"text": "default", "id": "g2", "leaf": True},
+            ],
+        },
+    }
+    monkeypatch.setattr(c, "_post", lambda path, body: tree)
+    nodes = c.list_org_tree()
+    ids = {n["id"] for n in nodes}
+    assert ids == {"root", "g1", "g1a", "g2"}
+
+
+def test_list_org_members_splits_users_and_subgroups(monkeypatch):
+    """listItem 返回的行里 org:true 为子组（带策略），org:false 为用户；分别归类返回。"""
+    c = _client()
+    resp = {
+        "data": [
+            {"org": True, "id": "sub1", "name": "子组A", "strategy": "组默认策略,公司基础白名单"},
+            {"org": False, "name": "userA", "strategy": "公司基础白名单,上网审计策略", "status": True},
+            {"org": False, "name": "userB", "strategy": "没有策略", "status": True},
+        ],
+        "count": 3,
+        "success": True,
+    }
+    monkeypatch.setattr(c, "_post", lambda path, body: resp)
+    out = c.list_org_members("g1")
+    assert [u["name"] for u in out["users"]] == ["userA", "userB"]
+    assert out["users"][0]["strategy"] == "公司基础白名单,上网审计策略"
+    # 子组行单独归类，带 id 与该组的生效策略（供展开用户的「继承占位」）
+    assert out["subgroups"] == [{"id": "sub1", "name": "子组A", "strategy": "组默认策略,公司基础白名单"}]
+
+
+def test_analyze_policy_usage_counts_users_and_flags_unused(monkeypatch):
+    """策略引用校验：按用户 strategy 并集计数，无人引用的标 used=False。"""
+    from app.services import policy_usage_service
+
+    class _FakeWeb:
+        def login(self):
+            pass
+
+        def clone_session(self):
+            return self
+
+        def list_policies(self):
+            return {
+                "access_policies": [
+                    {"name": "公司基础白名单", "order": 1, "status": True, "depict": "", "founder": "admin"},
+                    {"name": "没人用的白名单", "order": 2, "status": True, "depict": "", "founder": "admin"},
+                ]
+            }
+
+        def list_org_tree(self):
+            return [{"id": "g1", "name": "组1"}]
+
+        def list_org_members(self, org_id, **kw):
+            return {
+                "users": [
+                    {"name": "u1", "strategy": "公司基础白名单,上网审计策略", "status": True},
+                    {"name": "u2", "strategy": "公司基础白名单", "status": True},
+                    {"name": "u3", "strategy": "没有策略", "status": True},
+                ],
+                "subgroups": [],
+            }
+
+    fake = _FakeWeb()
+    monkeypatch.setattr(policy_usage_service.session_pool, "get_web_client", lambda inst: fake)
+    policy_usage_service.policy_usage_cache.invalidate(777)
+
+    class _Inst:
+        id = 777
+
+    out = policy_usage_service.analyze_policy_usage(_Inst())
+    by_name = {p["name"]: p for p in out["policies"]}
+    assert by_name["公司基础白名单"]["user_count"] == 2 and by_name["公司基础白名单"]["used"] is True
+    assert by_name["没人用的白名单"]["user_count"] == 0 and by_name["没人用的白名单"]["used"] is False
+    assert out["unused_count"] == 1 and out["total_users"] == 3
+    # 无人引用的排在前面（醒目）
+    assert out["policies"][0]["name"] == "没人用的白名单"
+
+
+def test_analyze_policy_usage_expands_inherited_group_strategy(monkeypatch):
+    """深圳式继承：用户行 strategy 为占位符「与所属组相同」时，用所属组的策略展开计数，
+    不再把整组继承的策略误报为无人引用。"""
+    from app.services import policy_usage_service
+
+    class _FakeWeb:
+        def login(self):
+            pass
+
+        def clone_session(self):
+            return self
+
+        def list_policies(self):
+            return {
+                "access_policies": [
+                    {"name": "自研虚拟桌面外网白名单", "order": 1, "status": True, "depict": "", "founder": "admin"},
+                    {"name": "公司基础白名单", "order": 2, "status": True, "depict": "", "founder": "admin"},
+                    {"name": "真没人用", "order": 3, "status": True, "depict": "", "founder": "admin"},
+                ]
+            }
+
+        def list_org_tree(self):
+            # 父组 P（含子组 L 的行）与叶子组 L（含继承占位的用户）
+            return [{"id": "P", "name": "自研虚拟桌面"}, {"id": "L", "name": "自研虚拟桌面外网白名单"}]
+
+        def list_org_members(self, org_id, **kw):
+            if org_id == "P":
+                # 父组列表里，子组 L 的行带该组的完整生效策略
+                return {
+                    "users": [],
+                    "subgroups": [
+                        {"id": "L", "name": "自研虚拟桌面外网白名单",
+                         "strategy": "自研虚拟桌面外网白名单,公司基础白名单"},
+                    ],
+                }
+            # 叶子组 L 的用户：完全继承所属组 → 占位符
+            return {"users": [{"name": "ip:172.29.125.0", "strategy": "与所属组相同", "status": True}], "subgroups": []}
+
+    fake = _FakeWeb()
+    monkeypatch.setattr(policy_usage_service.session_pool, "get_web_client", lambda inst: fake)
+    policy_usage_service.policy_usage_cache.invalidate(778)
+
+    class _Inst:
+        id = 778
+
+    out = policy_usage_service.analyze_policy_usage(_Inst())
+    by_name = {p["name"]: p for p in out["policies"]}
+    # 占位符展开为组策略 → 这两条被判「有人引用」
+    assert by_name["自研虚拟桌面外网白名单"]["used"] is True and by_name["自研虚拟桌面外网白名单"]["user_count"] == 1
+    assert by_name["公司基础白名单"]["used"] is True
+    # 组策略里没有的才是真无人引用
+    assert by_name["真没人用"]["used"] is False
+    assert out["unused_count"] == 1 and out["total_users"] == 1
 

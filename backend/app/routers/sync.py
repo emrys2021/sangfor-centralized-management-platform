@@ -11,6 +11,8 @@ from app.core.auth import CurrentUser, get_current_user
 from app.db.base import get_db
 from app.sangfor.web_client import SangforWebError
 from app.schemas.sync import (
+    BatchCompareRequest,
+    BatchCompareResult,
     BatchSyncRequest,
     BatchSyncResult,
     SyncApplyRequest,
@@ -18,7 +20,7 @@ from app.schemas.sync import (
     SyncDiffRequest,
     SyncDiffResult,
 )
-from app.services import sync_service
+from app.services import compare_service, sync_service
 
 router = APIRouter(prefix="/api/sync", tags=["sync"])
 
@@ -57,6 +59,25 @@ def batch_sync(
             push_all=req.push_all,
             mirror=req.mirror,
             dry_run=req.dry_run,
+            allow_degrade=req.allow_degrade,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except SangforWebError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/compare", response_model=BatchCompareResult)
+def compare(req: BatchCompareRequest, db: Session = Depends(get_db)):
+    """只读全量对比：把源实例某类对象的全集与内容，逐个目标比对，返回四分类结果。不写设备。"""
+    try:
+        return compare_service.compare(
+            db,
+            object_type=req.object_type,
+            source_instance_id=req.source_instance_id,
+            target_instance_ids=req.target_instance_ids,
+            names_only=req.names_only,
+            force=req.force,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -81,6 +102,7 @@ def apply_sync(
             target_instance_ids=req.target_instance_ids,
             push_all=req.push_all,
             dry_run=req.dry_run,
+            allow_degrade=req.allow_degrade,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

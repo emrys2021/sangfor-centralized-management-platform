@@ -5,7 +5,9 @@
 跨实例同步策略的核心障碍：规则引用的应用 / URL 库携带 ``crc``，而 **crc 由各设备独立
 分配**（尤其自定义应用），源设备的 crc 拿到目标设备无效。本模块据目标设备的应用目录树
 （``listAppTree``）按**引用路径**反查目标自己的 crc，重建可写报文；并在目标缺少被引用的
-**自定义**应用 / URL 库时，复用已确认的写接口先把它们建到目标（内置对象无法创建，仅告警）。
+**自定义**应用 / URL 库时，复用已确认的写接口先把它们建到目标。若仍有**无法解析的引用**（内置
+对象在目标缺失、或自定义引用创建失败），写策略会丢弃它、得到与源不等价（降级）的版本——故默认
+**拒绝**写入，需显式允许降级（``allow_degrade``）才写（详见 :func:`sync_policy_to_target`）。
 
 落盘走**已验证的写路径**，不臆造新报文：
 
@@ -219,18 +221,30 @@ def sync_policy_to_target(
     source_custom_urls: set[str],
     auto_create: bool = True,
     app_index: dict[str, dict] | None = None,
+    allow_degrade: bool = False,
 ) -> dict:
-    """把源策略同步到目标实例：crc 重映射 + 自动建自定义引用 + 读-改-写 / 新建（最大努力）。
+    """把源策略同步到目标实例：crc 重映射 + 自动建自定义引用 + 读-改-写 / 新建。
 
     **不抛异常**——逐步收集结果，任一子请求（建引用 / 写策略）失败都记入 ``details`` 并以
     ``ok=False`` 返回，便于上层把每个请求的成功 / 失败与详情展示给用户。
 
-    返回 outcome：``{"ok","dry_run","payload","created","missing","details", ...}``。
+    **降级同步的处理（甲+乙）**：**无法解析的引用**——① **内置**对象在目标缺失（目标应用库版本较旧、
+    无法创建），或 ② 自定义引用对象**创建失败**——若丢弃它写策略，会得到与源**不等价（降级）**的
+    版本。为避免「悄悄改语义、还报成功」：
 
+    - dry-run 始终预览（展示会跳过哪些引用、标 ``degraded``）；
+    - **真实写入**：``allow_degrade=False``（默认）时**拒绝写入策略**、返回 ``refused=True`` / ``ok=False``。
+      其中「内置缺失」在**创建任何对象之前**即拒绝（完全不改设备）；「自定义创建失败」时可能已建部分
+      对象、保留在目标（消息会说明），但策略本身不写。``allow_degrade=True`` 时才写入降级版本、标
+      ``degraded=True``。
+
+    返回 outcome：``{"ok","degraded","refused","dry_run","payload","created","missing","details", ...}``。
+
+    - ``degraded``：本次写入（或将写入）的策略因丢弃了无法解析的引用而与源不等价。
+    - ``refused``：因存在无法解析的引用且未允许降级而**未写策略**（严格模式拦截）。
     - ``created``：本次（或 dry-run 预演）创建**或更新**的被引用自定义对象名（目标已有同名 →
-      改成与源一致，不再走 add 报「名字已被使用」；同一对象被多个引用命中只处理一次）。
-    - ``missing``：无法解析且无法自动创建的引用（**内置**对象在目标缺失，多因应用库版本较旧），
-      会被**跳过**（从规则中丢弃），不阻断其余引用与策略同步。
+      改成与源一致；同一对象被多个引用命中只处理一次）。
+    - ``missing``：无法解析的引用（内置缺失 **或** 自定义创建失败）；降级写入时被跳过，拒绝时策略未写。
     - ``details``：每个子请求的成功 / 失败逐条记录。
 
     性能：每个目标只 ``list_app_tree`` 一次建索引（自动创建后会重取一次以解析新对象 crc）；
@@ -248,6 +262,19 @@ def sync_policy_to_target(
     ensured: list[str] = []  # 创建或更新成功的对象名（供上层计数）
     if missing and auto_create:
         creatable, builtin = classify_missing(missing, source_custom_apps, source_custom_urls)
+        # 乙（修正 codex #1）：真实写入 + 存在会导致降级的内置缺失 + 未允许降级 → 在**创建任何引用
+        # 对象、改动设备之前**就拒绝。否则会先把自定义引用对象建到目标、再拒绝写策略，导致「已拒绝、
+        # 未写入」与真实行为不符（设备其实已被改）。builtin 由创建自定义对象无法补齐，故此刻即可判定。
+        if builtin and not allow_degrade and not dry_run:
+            for path in builtin:
+                details.append(f"内置引用「{path}」目标缺失、无法创建")
+            details.append(
+                f"已拒绝写入：目标缺 {len(builtin)} 个内置引用，直接写会得到与源不等价（降级）的策略"
+                "（如拒绝规则少挡了对象=安全缺口）。已阻止——**未创建任何对象、未改设备**。"
+                "如确需写入降级版本，请勾选「允许降级同步」后重试。"
+            )
+            return {"ok": False, "degraded": True, "refused": True, "dry_run": dry_run, "payload": None,
+                    "created": [], "missing": builtin, "details": details}
         if creatable:
             created, updated, failed = ensure_referenced_objects(
                 source_web, target_web, creatable, dry_run=dry_run
@@ -261,14 +288,27 @@ def sync_policy_to_target(
             for f in failed:
                 details.append(f"处理{_label(f['kind'])}「{f['name']}」：失败 — {f['error']}")
         if dry_run:
-            missing = builtin  # 预览：内置缺失将跳过
+            missing = builtin  # 预览：内置缺失将跳过（dry-run 不真的创建，无创建失败）
         else:
             index = build_app_index(target_web.list_app_tree())  # 重取，解析新建/更新对象的 crc
             rules, missing = build_remapped_rules(source_detail, index)
-            _, missing = classify_missing(missing, source_custom_apps, source_custom_urls)  # 仅留内置缺失
-    # 最大努力：build_remapped_rules 已自动丢弃无法解析的引用，missing 即被跳过项
+            # missing = 重映射后仍无法解析的引用 = 内置缺失（已在上方早退）+ **创建失败的自定义引用**。
+            # 不再过滤掉创建失败的自定义——它们同样会从策略里被丢弃、导致降级（修正 codex 姊妹 bug）。
+    # 丢弃无法解析的引用后 missing 即被跳过项；有跳过 = 写出的策略与源不等价（降级）。
     for path in missing:
-        details.append(f"内置引用「{path}」目标缺失、无法创建：已跳过该引用")
+        details.append(f"引用「{path}」目标缺失或创建失败：写策略会丢弃该引用")
+    degraded = bool(missing)
+
+    # 后置拒绝（修正 codex 姊妹 bug）：真实写入时，若因**自定义引用创建失败**仍有引用缺失 → 默认拒绝
+    # 写策略（不写出缺引用的降级版本）。注意此刻可能已成功创建部分引用对象，保留在目标（会在消息里说明）。
+    if degraded and not allow_degrade and not dry_run:
+        note = f"（已成功创建/更新 {len(ensured)} 个引用对象、保留在目标）" if ensured else ""
+        details.append(
+            f"已拒绝写入策略：仍有 {len(missing)} 个引用无法解析（内置缺失或自定义对象创建失败），"
+            f"直接写会得到与源不等价（降级）的策略{note}。如确需写入降级版本，请勾选「允许降级同步」后重试。"
+        )
+        return {"ok": False, "degraded": True, "refused": True, "dry_run": dry_run, "payload": None,
+                "created": ensured, "missing": missing, "details": details}
 
     verb = "更新策略" if exists else "新建策略"
     try:
@@ -296,12 +336,20 @@ def sync_policy_to_target(
             outcome = target_web.create_policy(data, dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001  写策略失败：记录详情、以 ok=False 返回（不抛）
         details.append(f"{verb}：失败 — {exc}")
-        return {"ok": False, "dry_run": dry_run, "payload": None,
-                "created": ensured, "missing": missing, "details": details}
+        return {"ok": False, "degraded": degraded, "refused": False, "dry_run": dry_run,
+                "payload": None, "created": ensured, "missing": missing, "details": details}
 
-    details.append(f"{verb}：{'dry-run 预览' if outcome.get('dry_run') else '成功'}")
+    if degraded:
+        details.append(
+            f"⚠ 降级同步：已跳过 {len(missing)} 个无法解析的引用"
+            "（内置缺失或自定义创建失败），写入的策略与源**不等价**。"
+        )
+    verb_state = "dry-run 预览" if outcome.get("dry_run") else "降级写入" if degraded else "成功"
+    details.append(f"{verb}：{verb_state}")
     outcome = dict(outcome)
     outcome["ok"] = True
+    outcome["degraded"] = degraded
+    outcome["refused"] = False
     outcome["created"] = ensured
     outcome["missing"] = missing
     outcome["details"] = details

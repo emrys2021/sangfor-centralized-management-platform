@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     # 上次结果、不再逐条访问设备；设 0 可关闭缓存。可被「重新分析」强制刷新绕过。
     analysis_cache_ttl: int = Field(300, validation_alias="SANGFOR_ANALYSIS_CACHE_TTL")
 
+    # 单次请求内并行拉取设备的线程数上限（各分析/对比/搜索的线程池大小）。
+    fetch_concurrency: int = Field(8, validation_alias="SANGFOR_FETCH_CONCURRENCY")
+
+    # 对**同一台 AC** 的**全局**并发上限（跨请求，见 web_base 的 per-origin 信号量）：无论同时
+    # 有多少请求，对单台设备的在途 CGI 请求数不超过此值，避免高峰压垮设备。一般设为
+    # fetch_concurrency 的 1~2 倍，让少量并发请求不至于共享太少通道、互相拖慢。
+    global_fetch_concurrency: int = Field(16, validation_alias="SANGFOR_GLOBAL_FETCH_CONCURRENCY")
+
     # API 访问令牌：非空时所有 /api 路由要求请求头 ``X-API-Token`` 或 ``Authorization: Bearer``
     # 与之匹配；为空表示不鉴权（仅开发，启动时会告警）。
     api_token: str = Field("", validation_alias="SANGFOR_API_TOKEN")

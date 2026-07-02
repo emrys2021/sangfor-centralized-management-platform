@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from app.sangfor.customrule_cgi import CustomRuleCgiMixin
+from app.sangfor.org_cgi import OrgCgiMixin
 from app.sangfor.policy_cgi import PolicyCgiMixin
 from app.sangfor.url_cgi import UrlCgiMixin
 from app.sangfor.web_base import CONFIRMED_WRITES, SangforWebBase, SangforWebError
@@ -19,9 +20,9 @@ from app.sangfor.web_base import CONFIRMED_WRITES, SangforWebBase, SangforWebErr
 __all__ = ["CONFIRMED_WRITES", "SangforWebClient", "SangforWebError"]
 
 
-class SangforWebClient(CustomRuleCgiMixin, UrlCgiMixin, PolicyCgiMixin, SangforWebBase):
+class SangforWebClient(CustomRuleCgiMixin, UrlCgiMixin, PolicyCgiMixin, OrgCgiMixin, SangforWebBase):
     """单个 AC 实例的 Web/CGI 会话客户端。
 
-    组合：传输/鉴权基类 :class:`SangforWebBase` + 三类 CGI 能力 mixin
-    （自定义应用 / URL 库 / 访问权限策略）。
+    组合：传输/鉴权基类 :class:`SangforWebBase` + 各 CGI 能力 mixin
+    （自定义应用 / URL 库 / 访问权限策略 / 组织·用户）。
     """

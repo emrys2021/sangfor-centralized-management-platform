@@ -15,8 +15,10 @@ import type {
   PolicyApplicationUpdate,
   PolicyCreateInput,
   PolicyDetail,
+  BatchCompareResult,
   BatchSyncResult,
   PolicyList,
+  PolicyUsageResult,
   SearchResult,
   SyncApplyResult,
   SyncDiffResult,
@@ -120,6 +122,14 @@ export const policyApi = {
   // 「选择适用应用」应用目录树（规则编辑时挑选应用/URL，含各节点 crc）。
   appTree: (instanceId: number) =>
     http.get<AppTree>(`/instances/${instanceId}/policies/app-tree`).then((r) => r.data),
+  // 策略引用校验：每条策略被多少用户引用、标出无人引用的。遍历组织树较慢，放宽超时。
+  usage: (instanceId: number, refresh = false) =>
+    http
+      .get<PolicyUsageResult>(`/instances/${instanceId}/policies/usage`, {
+        timeout: 300000,
+        params: { refresh },
+      })
+      .then((r) => r.data),
   // 新建访问权限策略（opr=add）。dry_run 时仅返回报文预览。
   create: (instanceId: number, body: PolicyCreateInput, dryRun = true) =>
     http
@@ -179,6 +189,7 @@ export const syncApi = {
     target_instance_ids: number[];
     push_all: boolean;
     dry_run: boolean;
+    allow_degrade?: boolean;
   }) => http.post<SyncApplyResult>("/sync/apply", body).then((r) => r.data),
   // 批量同步整类对象；mirror=true 时删除目标多余对象。建索引/逐条写较慢，放宽超时。
   batch: (body: {
@@ -188,7 +199,17 @@ export const syncApi = {
     push_all: boolean;
     mirror: boolean;
     dry_run: boolean;
+    allow_degrade?: boolean;
   }) => http.post<BatchSyncResult>("/sync/batch", body, { timeout: 300000 }).then((r) => r.data),
+  // 只读对比：names_only=true 只比名单（仅源/仅目标/两边都有，秒级）；否则比内容
+  // （仅源/仅目标/一致/不一致，逐对象拉快照较慢，放宽超时）。
+  compare: (body: {
+    object_type: ObjectType;
+    source_instance_id: number;
+    target_instance_ids: number[];
+    names_only?: boolean;
+    force?: boolean;
+  }) => http.post<BatchCompareResult>("/sync/compare", body, { timeout: 300000 }).then((r) => r.data),
 };
 
 // ---- 全局搜索 ----

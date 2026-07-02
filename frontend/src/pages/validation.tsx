@@ -11,6 +11,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CheckList } from "@/components/validation/check-list";
 import { LegendChip } from "@/components/validation/legend-chip";
+import { PolicyUsageCard } from "@/components/validation/policy-usage-card";
 import { Stat } from "@/components/validation/stat";
 import { useCurrentInstance } from "@/hooks/use-current-instance";
 import { useAppStore } from "@/stores/app";
@@ -172,23 +173,55 @@ export function ValidationPage() {
         title="数据校验"
         description="自定义应用桑基图展示访问权限策略 → 自定义应用 → 协议·端口·方向 → 资源(IP/域名)；自定义 URL 桑基图展示访问权限策略 → URL 库 → URL 条目的覆盖关系。"
         actions={
-          <div className="flex items-center gap-2">
-            {data?.cached && !analyzing && (
-              <span
-                className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-600 dark:text-amber-400"
-                title="结果来自服务端缓存，点「重新分析」可强制重算最新数据"
-              >
-                缓存{formatCacheAge(data.cache_age_seconds)}
-              </span>
-            )}
-            <Button variant="outline" onClick={() => reanalyze.mutate()} disabled={analyzing}>
-              <RefreshCw className={analyzing ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> 重新分析
-            </Button>
-          </div>
+          view === "policy-usage" ? null : (
+            <div className="flex items-center gap-2">
+              {data?.cached && !analyzing && (
+                <span
+                  className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-600 dark:text-amber-400"
+                  title="结果来自服务端缓存，点「重新分析」可强制重算最新数据"
+                >
+                  缓存{formatCacheAge(data.cache_age_seconds)}
+                </span>
+              )}
+              <Button variant="outline" onClick={() => reanalyze.mutate()} disabled={analyzing}>
+                <RefreshCw className={analyzing ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> 重新分析
+              </Button>
+            </div>
+          )
         }
       />
 
-      {q.isLoading ? (
+      {/* 标签页常驻：策略引用校验作为独立 tab（自带数据与加载，不依赖桑基图分析） */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <Tabs value={view} onValueChange={(v) => setView(v as ValidationView)}>
+          <TabsList>
+            <TabsTrigger value="app-sankey">自定义应用桑基图</TabsTrigger>
+            <TabsTrigger value="url-sankey">自定义URL桑基图</TabsTrigger>
+            <TabsTrigger value="graph">关系图（应用相似度）</TabsTrigger>
+            <TabsTrigger value="policy-usage">策略引用校验</TabsTrigger>
+          </TabsList>
+        </Tabs>
+        {view !== "graph" && view !== "policy-usage" && (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>信息密度</span>
+            <span>疏</span>
+            <input
+              type="range"
+              min={1}
+              max={100}
+              value={density}
+              onChange={(e) => setDensity(Number(e.target.value))}
+              className="h-1.5 w-40 cursor-pointer accent-[hsl(var(--primary))]"
+              title={`每节点高度 ${nodePx}px`}
+            />
+            <span>密</span>
+          </div>
+        )}
+      </div>
+
+      {view === "policy-usage" ? (
+        <PolicyUsageCard instanceId={instanceId} />
+      ) : q.isLoading ? (
         <Card>
           <CenteredSpinner label="正在拉取自定义应用、URL 库和策略关系，请稍候…" />
         </Card>
@@ -218,32 +251,6 @@ export function ValidationPage() {
               {data.errors.length} 项分析数据拉取失败，已跳过（结果可能不完整）。
             </div>
           )}
-
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <Tabs value={view} onValueChange={(v) => setView(v as ValidationView)}>
-              <TabsList>
-                <TabsTrigger value="app-sankey">自定义应用桑基图</TabsTrigger>
-                <TabsTrigger value="url-sankey">自定义URL桑基图</TabsTrigger>
-                <TabsTrigger value="graph">关系图（应用相似度）</TabsTrigger>
-              </TabsList>
-            </Tabs>
-            {view !== "graph" && (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>信息密度</span>
-                <span>疏</span>
-                <input
-                  type="range"
-                  min={1}
-                  max={100}
-                  value={density}
-                  onChange={(e) => setDensity(Number(e.target.value))}
-                  className="h-1.5 w-40 cursor-pointer accent-[hsl(var(--primary))]"
-                  title={`每节点高度 ${nodePx}px`}
-                />
-                <span>密</span>
-              </div>
-            )}
-          </div>
 
           {view === "app-sankey" ? (
             <>

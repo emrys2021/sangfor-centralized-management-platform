@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight, GitCompareArrows, RefreshCw, Rocket } from "lucide-react";
+import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight, GitCompareArrows, RefreshCw, Rocket, Scale } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
@@ -21,8 +21,13 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { customRuleApi, instanceApi, policyApi, syncApi, urlApi } from "@/lib/api";
 import type {
+  BatchCompareResult,
   BatchSyncResult,
   BatchTargetResult,
+  CompareItem,
+  CompareStatus,
+  CompareTargetResult,
+  FieldDiff,
   ObjectType,
   SyncApplyResult,
   SyncDiffResult,
@@ -34,6 +39,10 @@ const OBJECT_TYPES: { value: ObjectType; label: string }[] = [
   { value: "url", label: "自定义 URL 库" },
   { value: "policy", label: "访问权限策略" },
 ];
+
+// 对象选择框里的特殊项：选它表示「整类全部对象」（对比/同步 的批量子选项）。
+// 用不可能与真实对象名冲突的哨兵值。
+const ALL_OBJECTS = "__ALL_OBJECTS__";
 
 // ── 字段元数据 ────────────────────────────────────────────────────────────────
 
@@ -48,8 +57,11 @@ const FIELD_LABELS: Record<string, string> = {
 
 // 内容为多行条目的字段，做行级别 diff
 const LIST_FIELDS = new Set(["ip_range", "domain", "url"]);
-// 展示权重低的字段（放末尾，且默认折叠到「相同」区）
-const LOW_PRIORITY = new Set(["apptype", "appname", "protocol_num", "status"]);
+// 高优先级「主体」字段：功能配置（方向/协议/端口/IP/域名，及 URL 库的 URL 列表），差异突出显示。
+// 其余字段（描述/状态/应用类型/应用名/协议号/关键字…）的差异也显示，但弱化、不抢主体。
+const HIGH_PRIORITY = new Set([
+  "direction", "protocol", "port_mode", "port_range", "ip_mode", "ip_range", "domain", "url",
+]);
 
 const DIRECTION_MAP: Record<string, string> = { both: "双向", upload: "上行", download: "下行" };
 const PROTOCOL_MAP: Record<string, string> = { "0": "全部", "6": "TCP", "17": "UDP", "1": "ICMP" };
@@ -152,12 +164,14 @@ function ListDiff({
 
 type AppRef = { path: string; custom: boolean };
 type UrlRef = { name: string; custom: boolean };
-type PolicyRule = { name: string; apps: AppRef[]; urls: UrlRef[] };
+type PolicyRule = { name: string; action: string; apps: AppRef[]; urls: UrlRef[] };
+type NetRule = { dip: string; service: string; action: unknown; time: string };
 
 function asRules(val: unknown): PolicyRule[] {
   if (!Array.isArray(val)) return [];
   return val.map((r: any) => ({
     name: String(r?.name ?? ""),
+    action: String(r?.action ?? ""),
     // 兼容旧结构（字符串数组）与新结构（{path/name, custom}）
     apps: Array.isArray(r?.apps)
       ? r.apps.map((a: any) =>
@@ -172,26 +186,62 @@ function asRules(val: unknown): PolicyRule[] {
   }));
 }
 
+function asNetRules(val: unknown): NetRule[] {
+  if (!Array.isArray(val)) return [];
+  return val.map((r: any) => ({
+    dip: String(r?.dip ?? ""),
+    service: String(r?.service ?? ""),
+    action: r?.action,
+    time: String(r?.time ?? ""),
+  }));
+}
+
+// 动作：应用规则 allow/deny，端口规则 1/0 或布尔 → 放行 / 拒绝
+function actionText(a: unknown): string {
+  if (a === "allow" || a === true || a === 1) return "放行";
+  if (a === "deny" || a === false || a === 0) return "拒绝";
+  return String(a ?? "未知");
+}
+function netRuleText(r: NetRule): string {
+  const t = r.time && r.time !== "全天" ? ` · ${r.time}` : "";
+  return `${r.dip} · ${r.service} · ${actionText(r.action)}${t}`;
+}
+
+// 取某字段的目标值：diffs 里有该字段=不同、取 target；没有=两边相同、回退用源值。
+function targetVal(diffs: FieldDiff[], field: string, fallback: unknown): unknown {
+  const d = diffs.find((x) => x.field === field);
+  return d ? d.target : fallback;
+}
+
 function sameKeys(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((x) => b.includes(x));
 }
+// 规则一致 = 动作相同 且 引用应用/URL 相同
 function ruleEq(s: PolicyRule, t: PolicyRule): boolean {
   return (
+    s.action === t.action &&
     sameKeys(s.apps.map((a) => a.path), t.apps.map((a) => a.path)) &&
     sameKeys(s.urls.map((u) => u.name), t.urls.map((u) => u.name))
   );
 }
 
-// 统计规则级实际差异数：新增 + 变更 + 目标多出的规则条数（按位置对位匹配）。
-function countPolicyDiffs(srcRules: PolicyRule[], tgtRules: PolicyRule[], targetMissing: boolean): number {
-  const max = Math.max(srcRules.length, tgtRules.length);
+// 统计策略实际差异处数：规则级（新增/变更/目标多出，含动作差异）+ 段/策略级标量（启用、各段开关、
+// 端口规则、代理配置）。用于「差异 N 处」徽标。
+function countPolicyDiffs(src: Record<string, unknown>, diffs: FieldDiff[], targetMissing: boolean): number {
+  if (targetMissing) return asRules(src.rules).length + 1; // 目标整体缺失：整条策略将新增
+  const srcRules = asRules(src.rules);
+  const tgtRules = asRules(targetVal(diffs, "rules", src.rules));
   let n = 0;
+  const max = Math.max(srcRules.length, tgtRules.length);
   for (let i = 0; i < max; i++) {
     const s = srcRules[i];
     const tg = tgtRules[i];
-    if (!s && tg) n++; // 目标多出
-    else if (s && (targetMissing || !tg)) n++; // 新增
-    else if (s && tg && !ruleEq(s, tg)) n++; // 变更
+    if (!s && tg) n++;
+    else if (s && !tg) n++;
+    else if (s && tg && !ruleEq(s, tg)) n++;
+  }
+  for (const f of ["enable", "application_include", "network_include", "network_rules", "proxy_include", "proxy"]) {
+    if (diffs.some((d) => d.field === f)) n++;
   }
   return n;
 }
@@ -234,16 +284,91 @@ function CategoryRow({ label, items }: { label: string; items: { value: string; 
   );
 }
 
-function PolicyDiff({ srcRules, tgtRules, targetMissing }: { srcRules: PolicyRule[]; tgtRules: PolicyRule[]; targetMissing: boolean }) {
-  // 按规则顺序（位置）对位匹配：源第 N 条 ↔ 目标第 N 条（跨实例 rule_id 各设备独立分配，
-  // 只能按顺序对应才能比出规则内部应用/URL 的细粒度增减）。无论是否一致都展开规则内容，
-  // 并把引用分「自定义应用 / 内置应用 / 自定义URL库 / 内置URL库」展示。
+// 一行标量差异（启用/段开关/代理项）：相同弱化、不同高亮 源→目标。
+function ScalarLine({ label, s, t, changed }: { label: string; s: string; t?: string; changed: boolean }) {
+  return (
+    <div className="grid grid-cols-[76px_1fr_1fr] gap-x-3 items-baseline text-xs">
+      <span className={changed ? "text-amber-300/70" : "text-muted-foreground/50"}>{label}</span>
+      <span className={changed ? "text-emerald-400" : "text-muted-foreground/60"}>{s}</span>
+      {t === undefined ? (
+        <span className="text-muted-foreground/50 italic">（新建）</span>
+      ) : (
+        <span className={changed ? "text-red-400" : "text-muted-foreground/60"}>{t}</span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 策略差异：**只覆盖 应用控制 / 端口控制 / 代理控制 三段 + 启用状态**（其余段——Web 关键字/
+ * 文件类型过滤、邮件、QQ、SaaS 等——不参与对比、不在此显示）。应用/端口规则按位置对位、
+ * 忽略跨实例 rule_id；段开关为关时不比该段规则。
+ */
+function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown>; diffs: FieldDiff[]; targetMissing: boolean }) {
+  const srcRules = asRules(src.rules);
+  const tgtRules = targetMissing ? [] : asRules(targetVal(diffs, "rules", src.rules));
+
+  const srcEnable = src.enable !== false;
+  const tgtEnable = targetMissing ? undefined : targetVal(diffs, "enable", src.enable) !== false;
+  const srcAppInc = !!src.application_include;
+  const tgtAppInc = targetMissing ? false : !!targetVal(diffs, "application_include", src.application_include);
+  const srcNetInc = !!src.network_include;
+  const tgtNetInc = targetMissing ? false : !!targetVal(diffs, "network_include", src.network_include);
+  const srcProxyInc = !!src.proxy_include;
+  const tgtProxyInc = targetMissing ? false : !!targetVal(diffs, "proxy_include", src.proxy_include);
+
+  // 策略级 / 段开关差异（只列不同的）
+  const scalarLines: { label: string; s: string; t?: string; changed: boolean }[] = [];
+  const onoff = (v: boolean) => (v ? "启用" : "关闭");
+  if (targetMissing || srcEnable !== tgtEnable)
+    scalarLines.push({ label: "策略启用", s: srcEnable ? "启用" : "禁用", t: targetMissing ? undefined : tgtEnable ? "启用" : "禁用", changed: true });
+  if (targetMissing || srcAppInc !== tgtAppInc)
+    scalarLines.push({ label: "应用控制", s: onoff(srcAppInc), t: targetMissing ? undefined : onoff(tgtAppInc), changed: true });
+  if (targetMissing || srcNetInc !== tgtNetInc)
+    scalarLines.push({ label: "端口控制", s: onoff(srcNetInc), t: targetMissing ? undefined : onoff(tgtNetInc), changed: true });
+  if (targetMissing || srcProxyInc !== tgtProxyInc)
+    scalarLines.push({ label: "代理控制", s: onoff(srcProxyInc), t: targetMissing ? undefined : onoff(tgtProxyInc), changed: true });
+
+  // 端口控制规则（源/目标文本化后做行级增删）
+  const showNet = srcNetInc || tgtNetInc;
+  const netItems = showNet
+    ? diffCategory(asNetRules(src.network_rules).map(netRuleText), targetMissing ? [] : asNetRules(targetVal(diffs, "network_rules", src.network_rules)).map(netRuleText))
+    : [];
+
+  // 代理控制配置（http/sock/errorproto 开关）
+  const showProxy = srcProxyInc || tgtProxyInc;
+  const srcProxy = (src.proxy ?? {}) as Record<string, unknown>;
+  const tgtProxy = (targetMissing ? {} : (targetVal(diffs, "proxy", src.proxy) ?? {})) as Record<string, unknown>;
+  const proxyLabels: Record<string, string> = { http: "HTTP 代理", sock: "SOCKS 代理", errorproto: "非标准协议" };
+  const proxyLines = Object.entries(proxyLabels)
+    .map(([k, label]) => {
+      const sv = !!srcProxy[k];
+      const tv = !!tgtProxy[k];
+      return { label, s: onoff(sv), t: targetMissing ? undefined : onoff(tv), changed: targetMissing || sv !== tv };
+    })
+    .filter((l) => l.changed);
+
+  const showAppRules = srcAppInc || tgtAppInc;
   const max = Math.max(srcRules.length, tgtRules.length);
   const rows = Array.from({ length: max }, (_, i) => ({ s: srcRules[i], tg: tgtRules[i], pos: i + 1 }));
 
   return (
-    <div className="space-y-1.5">
-      {rows.map(({ s, tg, pos }) => {
+    <div className="space-y-2">
+      {/* 策略级 / 段开关差异 */}
+      {scalarLines.length > 0 && (
+        <div className="space-y-0.5 rounded border border-amber-500/20 bg-amber-500/[0.06] px-3 py-1.5">
+          {scalarLines.map((l) => (
+            <ScalarLine key={l.label} {...l} />
+          ))}
+        </div>
+      )}
+
+      {/* 应用控制：规则逐条对位（含动作） */}
+      {showAppRules && (
+        <div className="space-y-1">
+          <div className="text-[11px] font-medium text-muted-foreground/60">应用控制</div>
+          <div className="space-y-1.5">
+            {rows.map(({ s, tg, pos }) => {
         const isExtra = !s && !!tg; // 目标多出（将删除）
         const isNew = !!s && (targetMissing || !tg);
         const effTg = targetMissing ? undefined : tg; // 目标整体不存在时不参与比对（全部按新增）
@@ -305,6 +430,32 @@ function PolicyDiff({ srcRules, tgtRules, targetMissing }: { srcRules: PolicyRul
               ) : (
                 <span className="text-[10px] text-muted-foreground/40">一致</span>
               )}
+              {(() => {
+                const sa = s?.action;
+                const ta = effTg?.action;
+                if (s && effTg && sa !== ta)
+                  return (
+                    <span className="text-[10px]">
+                      <span className="text-emerald-400">{actionText(sa)}</span>
+                      <span className="mx-0.5 text-muted-foreground/40">→</span>
+                      <span className="text-red-400">{actionText(ta)}</span>
+                    </span>
+                  );
+                const a = (s ?? tg)?.action;
+                return a !== undefined ? (
+                  <span
+                    className={
+                      a === "deny"
+                        ? "text-[10px] text-red-400/80"
+                        : a === "allow"
+                        ? "text-[10px] text-emerald-400/80"
+                        : "text-[10px] text-muted-foreground/50"
+                    }
+                  >
+                    {actionText(a)}
+                  </span>
+                ) : null;
+              })()}
             </div>
             {empty ? (
               <p className="text-muted-foreground/40">（无应用 / URL 引用）</p>
@@ -318,92 +469,83 @@ function PolicyDiff({ srcRules, tgtRules, targetMissing }: { srcRules: PolicyRul
             )}
           </div>
         );
-      })}
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* 端口控制：规则行级增删（源/目标文本化） */}
+      {showNet && netItems.length > 0 && (
+        <div className="space-y-1">
+          <div className="text-[11px] font-medium text-muted-foreground/60">端口控制</div>
+          <span className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs">
+            {netItems.map((it, i) => (
+              <span key={i} className={`break-all ${REF_STATE_CLS[it.state]}`}>
+                {it.value}
+              </span>
+            ))}
+          </span>
+        </div>
+      )}
+
+      {/* 代理控制：http/sock/errorproto 开关差异 */}
+      {showProxy && proxyLines.length > 0 && (
+        <div className="space-y-1">
+          <div className="text-[11px] font-medium text-muted-foreground/60">代理控制</div>
+          <div className="space-y-0.5">
+            {proxyLines.map((l) => (
+              <ScalarLine key={l.label} {...l} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-// ── 单目标对照卡片 ────────────────────────────────────────────────────────────
+// ── 对象内容差异主体（策略规则级 / 其他字段级），TargetCard 与全量对比复用 ─────────────
 
-function TargetCard({
-  t,
-  src,
+function ObjectDiffBody({
   objectType,
-  sourceName,
+  src,
+  diffs,
+  targetMissing,
 }: {
-  t: SyncDiffResult["targets"][number];
-  src: Record<string, unknown>;
   objectType: ObjectType;
-  sourceName: string;
+  src: Record<string, unknown>;
+  diffs: FieldDiff[];
+  targetMissing: boolean;
 }) {
   const [showSameFields, setShowSameFields] = useState(false);
+  const diffedFields = useMemo(() => new Set(diffs.map((d) => d.field)), [diffs]);
 
-  const diffedFields = useMemo(() => new Set(t.diffs.map((d) => d.field)), [t.diffs]);
-  const targetMissing = !t.exists && !t.error;
-
-  // 整理所有需展示的字段，按「变化 > 相同」分组
-  const { changedFields, sameFields } = useMemo(() => {
+  // 整理字段：变化的按「主体（高优先级）/ 次要」分开，其余归「相同」。
+  const { mainChanged, minorChanged, sameFields } = useMemo(() => {
     const all = Object.keys(src).filter((k) => k in FIELD_LABELS || LIST_FIELDS.has(k));
-    const changed: string[] = [];
+    const main: string[] = [];
+    const minor: string[] = [];
     const same: string[] = [];
     for (const k of all) {
-      if (LOW_PRIORITY.has(k)) { same.push(k); continue; }
-      if (targetMissing || diffedFields.has(k)) changed.push(k);
+      if (targetMissing || diffedFields.has(k)) (HIGH_PRIORITY.has(k) ? main : minor).push(k);
       else same.push(k);
     }
-    return { changedFields: changed, sameFields: same };
+    return { mainChanged: main, minorChanged: minor, sameFields: same };
   }, [src, diffedFields, targetMissing]);
 
-  // 策略按规则级实际差异计数；其他对象按字段级 diff 计数。
-  const diffCount =
-    objectType === "policy"
-      ? countPolicyDiffs(
-          asRules(src.rules),
-          asRules(t.diffs.find((d) => d.field === "rules")?.target),
-          targetMissing
-        )
-      : t.diffs.length;
-
-  // 策略：以规则级实际差异数为准（后端因 rule_id 跨实例不同会误标 changed，但内容可能一致）
-  const reallyChanged = objectType === "policy" ? diffCount > 0 : t.changed;
-  const badge = t.error ? (
-    <Badge variant="destructive">读取错误</Badge>
-  ) : targetMissing ? (
-    <Badge variant="warning">目标不存在（将新增）</Badge>
-  ) : reallyChanged ? (
-    <Badge variant="warning">差异 {diffCount} 处</Badge>
-  ) : (
-    <Badge variant="success">已一致</Badge>
-  );
+  // 策略：应用/端口/代理三段 + 启用状态对比（后端已按内容判定，rule_id 差异不计）
+  if (objectType === "policy") {
+    return <PolicyDiff src={src} diffs={diffs} targetMissing={targetMissing} />;
+  }
 
   return (
-    <div className="rounded-lg border p-3 space-y-2">
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-semibold">
-          <span className="text-muted-foreground/70">{sourceName}</span>
-          <span className="mx-1.5 text-muted-foreground/50">→</span>
-          {t.instance_name}
-        </span>
-        {badge}
-      </div>
-
-      {t.error && <p className="text-xs text-destructive">{t.error}</p>}
-
-      {/* 策略：规则级对比 */}
-      {!t.error && objectType === "policy" && (
-        <PolicyDiff
-          srcRules={asRules(src.rules)}
-          tgtRules={asRules(t.diffs.find((d) => d.field === "rules")?.target)}
-          targetMissing={targetMissing}
-        />
-      )}
-
-      {/* 变化字段 */}
-      {!t.error && objectType !== "policy" && changedFields.length > 0 && (
+    // 自带统一竖向间距，避免在不同父容器（TargetCard / 对比展开行）里「变化」与「相同」块间距不一致
+    <div className="space-y-2">
+      {/* 主体变化：高优先级功能字段（方向/协议/端口/IP/域名/URL 列表），突出显示 */}
+      {mainChanged.length > 0 && (
         <div className="space-y-1.5">
-          {changedFields.map((field) => {
+          {mainChanged.map((field) => {
             const srcVal = src[field];
-            const diff = t.diffs.find((d) => d.field === field);
+            const diff = diffs.find((d) => d.field === field);
             const tgtVal = diff?.target;
 
             if (LIST_FIELDS.has(field)) {
@@ -440,8 +582,28 @@ function TargetCard({
         </div>
       )}
 
+      {/* 次要变化：其余字段的差异也显示，但弱化（暗底 + 淡色），不抢主体 */}
+      {minorChanged.length > 0 && (
+        <div className="space-y-0.5 rounded border border-border/30 bg-muted/[0.06] px-3 py-1.5">
+          {minorChanged.map((field) => {
+            const tgtVal = diffs.find((d) => d.field === field)?.target;
+            return (
+              <div key={field} className="grid grid-cols-[90px_1fr_1fr] gap-x-3 items-baseline text-xs">
+                <span className="text-muted-foreground/50 shrink-0">{FIELD_LABELS[field] ?? field}</span>
+                <span className="text-emerald-400/60 break-all">{fmtScalar(field, src[field]) || "—"}</span>
+                {targetMissing ? (
+                  <span className="text-muted-foreground/40 italic">（新建）</span>
+                ) : (
+                  <span className="text-red-400/60 break-all">{fmtScalar(field, tgtVal) || "—"}</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* 相同字段 ── 可折叠 */}
-      {!t.error && objectType !== "policy" && !targetMissing && sameFields.length > 0 && (
+      {!targetMissing && sameFields.length > 0 && (
         <div>
           <button
             className="flex items-center gap-1 text-xs text-muted-foreground/60 hover:text-muted-foreground/80 transition-colors"
@@ -487,9 +649,60 @@ function TargetCard({
   );
 }
 
+// ── 单目标对照卡片 ────────────────────────────────────────────────────────────
+
+function TargetCard({
+  t,
+  src,
+  objectType,
+  sourceName,
+}: {
+  t: SyncDiffResult["targets"][number];
+  src: Record<string, unknown>;
+  objectType: ObjectType;
+  sourceName: string;
+}) {
+  const targetMissing = !t.exists && !t.error;
+
+  // 策略按「规则级 + 段/启用级」实际差异计数；其他对象按字段级 diff 计数。
+  const diffCount = objectType === "policy" ? countPolicyDiffs(src, t.diffs, targetMissing) : t.diffs.length;
+
+  // 策略：以规则级实际差异数为准（后端因 rule_id 跨实例不同会误标 changed，但内容可能一致）
+  const reallyChanged = objectType === "policy" ? diffCount > 0 : t.changed;
+  const badge = t.error ? (
+    <Badge variant="destructive">读取错误</Badge>
+  ) : targetMissing ? (
+    <Badge variant="warning">目标不存在（将新增）</Badge>
+  ) : reallyChanged ? (
+    <Badge variant="warning">差异 {diffCount} 处</Badge>
+  ) : (
+    // 策略仅比核心控制段，不等于整条完全一致——文案讲清范围
+    <Badge variant="success">{objectType === "policy" ? "核心段一致" : "已一致"}</Badge>
+  );
+
+  return (
+    <div className="rounded-lg border p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-semibold">
+          <span className="text-muted-foreground/70">{sourceName}</span>
+          <span className="mx-1.5 text-muted-foreground/50">→</span>
+          {t.instance_name}
+        </span>
+        {badge}
+      </div>
+
+      {t.error && <p className="text-xs text-destructive">{t.error}</p>}
+      {!t.error && (
+        <ObjectDiffBody objectType={objectType} src={src} diffs={t.diffs} targetMissing={targetMissing} />
+      )}
+    </div>
+  );
+}
+
 // ── 源快照摘要 ────────────────────────────────────────────────────────────────
 
-function SourceSummary({ data, objectType }: { data: Record<string, unknown>; objectType: ObjectType }) {
+// 从规范化快照提取一组摘要 chip（方向/协议/条数/规则数…），源摘要与全量对比只读视图共用。
+function snapshotChips(data: Record<string, unknown>, objectType: ObjectType): { label: string; value: string }[] {
   const chips: { label: string; value: string }[] = [];
   if (objectType === "customrule") {
     if (data.direction) chips.push({ label: "方向", value: fmtScalar("direction", data.direction) });
@@ -513,8 +726,16 @@ function SourceSummary({ data, objectType }: { data: Record<string, unknown>; ob
     );
     if (refCount) chips.push({ label: "引用应用/URL", value: String(refCount) });
   }
+  return chips;
+}
 
-  const name = String(data.rulename ?? data.name ?? data.policy_name ?? "");
+function snapshotName(data: Record<string, unknown>): string {
+  return String(data.rulename ?? data.name ?? data.policy_name ?? "");
+}
+
+function SourceSummary({ data, objectType }: { data: Record<string, unknown>; objectType: ObjectType }) {
+  const chips = snapshotChips(data, objectType);
+  const name = snapshotName(data);
   const depict = String(data.depict ?? "").trim();
 
   return (
@@ -537,6 +758,70 @@ function SourceSummary({ data, objectType }: { data: Record<string, unknown>; ob
   );
 }
 
+// ── 只读快照视图（全量对比中「仅源有 / 仅目标有」的内容明细） ─────────────────────
+
+function SnapshotView({ data, objectType }: { data: Record<string, unknown>; objectType: ObjectType }) {
+  const chips = snapshotChips(data, objectType);
+  const depict = String(data.depict ?? "").trim();
+  // 列表型内容（URL 条目 / IP / 域名）逐条列出，中性色只读展示
+  const lists: { label: string; entries: string[] }[] = [];
+  if (objectType === "url") lists.push({ label: "URL 列表", entries: parseEntries(data.url) });
+  if (objectType === "customrule") {
+    const ips = parseEntries(data.ip_range);
+    const doms = parseEntries(data.domain);
+    if (ips.length) lists.push({ label: "IP 范围", entries: ips });
+    if (doms.length) lists.push({ label: "域名", entries: doms });
+  }
+  const rules = objectType === "policy" ? asRules(data.rules) : [];
+
+  return (
+    <div className="space-y-1.5 text-xs">
+      {depict && <p className="text-muted-foreground/70">{depict}</p>}
+      {chips.length > 0 && (
+        <div className="flex flex-wrap gap-x-4 gap-y-1">
+          {chips.map((c) => (
+            <span key={c.label} className="text-muted-foreground/70">
+              {c.label}：<span className="text-foreground/70">{c.value}</span>
+            </span>
+          ))}
+        </div>
+      )}
+      {lists.map((l) => (
+        <div key={l.label} className="grid grid-cols-[70px_1fr] gap-2">
+          <span className="text-muted-foreground/50 whitespace-nowrap">
+            {l.label}
+            <span className="text-muted-foreground/30">（{l.entries.length}）</span>
+          </span>
+          <span className="flex flex-wrap gap-x-2 gap-y-0.5 font-mono text-muted-foreground/70">
+            {l.entries.map((e, i) => (
+              <span key={i} className="break-all">{e}</span>
+            ))}
+          </span>
+        </div>
+      ))}
+      {rules.length > 0 && (
+        <div className="space-y-1">
+          {rules.map((r, i) => {
+            const apps = r.apps.map((a) => a.path);
+            const urls = r.urls.map((u) => u.name);
+            return (
+              <div key={i} className="rounded border border-border/40 bg-muted/10 px-2 py-1 space-y-0.5">
+                <div className="text-muted-foreground/60">规则 {i + 1}</div>
+                {apps.length > 0 && (
+                  <CategoryRow label="应用" items={apps.map((v) => ({ value: v, state: "same" as const }))} />
+                )}
+                {urls.length > 0 && (
+                  <CategoryRow label="URL 库" items={urls.map((v) => ({ value: v, state: "same" as const }))} />
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── 同步结果卡片（含重建报文 + 缺失引用告警） ───────────────────────────────────
 
 function ApplyResultCard({ r }: { r: TargetApplyResult }) {
@@ -547,11 +832,19 @@ function ApplyResultCard({ r }: { r: TargetApplyResult }) {
     <div className="rounded-lg border p-3 space-y-1.5">
       <div className="flex items-center justify-between">
         <span className="font-medium">{r.instance_name}</span>
-        <Badge variant={r.dry_run ? "warning" : r.success ? "success" : "destructive"}>
-          {r.dry_run ? "dry-run" : r.success ? "成功" : "失败"}
-        </Badge>
+        {r.refused ? (
+          <Badge variant="warning">已拒绝写策略</Badge>
+        ) : r.dry_run ? (
+          <Badge variant="warning">{r.degraded ? "dry-run · 降级" : "dry-run"}</Badge>
+        ) : !r.success ? (
+          <Badge variant="destructive">失败</Badge>
+        ) : r.degraded ? (
+          <Badge variant="warning">降级同步</Badge>
+        ) : (
+          <Badge variant="success">成功</Badge>
+        )}
       </div>
-      <div className="text-xs text-muted-foreground">{r.message}</div>
+      <div className={`text-xs ${r.refused || r.degraded ? "text-amber-300/90" : "text-muted-foreground"}`}>{r.message}</div>
 
       {r.details.length > 0 && (
         <div className="rounded-md border border-border/60 bg-muted/10 px-3 py-2 text-xs space-y-0.5">
@@ -572,7 +865,10 @@ function ApplyResultCard({ r }: { r: TargetApplyResult }) {
         <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-xs space-y-1">
           <div className="flex items-center gap-1.5 text-amber-300/90">
             <AlertTriangle className="h-3.5 w-3.5" />
-            {r.warnings.length} 个内置引用在目标缺失（多因目标应用库版本较旧），无法自动创建，同步时已跳过这些引用：
+            {r.warnings.length} 个引用在目标无法解析（内置对象缺失，或自定义引用创建失败）
+            {r.refused
+              ? "，因此已拒绝写入策略（策略未写入）："
+              : "，同步时已跳过这些引用（策略与源不等价）："}
           </div>
           <div className="flex flex-wrap gap-1 pl-5">
             {r.warnings.map((w) => (
@@ -680,6 +976,170 @@ function BatchResultCard({ t }: { t: BatchTargetResult }) {
   );
 }
 
+// ── 全量对比：结果渲染（只读） ────────────────────────────────────────────────
+
+const COMPARE_META: Record<CompareStatus, { label: string; cls: string }> = {
+  different: { label: "内容不一致", cls: "text-amber-400" },
+  source_only: { label: "仅源有", cls: "text-emerald-400" },
+  target_only: { label: "仅目标有", cls: "text-sky-400" },
+  both: { label: "两边都有", cls: "text-muted-foreground/70" },
+  error: { label: "读取失败", cls: "text-red-400" },
+  identical: { label: "内容一致", cls: "text-muted-foreground/60" },
+};
+
+// 单个对象行：可展开明细（不一致→字段/规则 diff；仅源/仅目标→只读快照）。
+function CompareItemRow({ item, objectType }: { item: CompareItem; objectType: ObjectType }) {
+  const [open, setOpen] = useState(false);
+  const expandable =
+    (item.status === "different" && !!item.source_snapshot) ||
+    (item.status === "source_only" && !!item.source_snapshot) ||
+    (item.status === "target_only" && !!item.target_snapshot);
+  return (
+    <div className="rounded border border-border/40">
+      <button
+        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-muted/20 transition-colors disabled:cursor-default disabled:hover:bg-transparent"
+        onClick={() => expandable && setOpen((v) => !v)}
+        disabled={!expandable}
+      >
+        {expandable ? (
+          open ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />
+        ) : (
+          <span className="w-3 shrink-0" />
+        )}
+        <span className={`break-all ${item.status === "identical" ? "text-muted-foreground/70" : "font-medium"}`}>
+          {item.name}
+        </span>
+        {item.status === "error" && item.error && <span className="text-red-400/80">— {item.error}</span>}
+      </button>
+      {open && expandable && (
+        <div className="border-t border-border/40 px-2.5 py-2">
+          {item.status === "different" && item.source_snapshot ? (
+            <ObjectDiffBody
+              objectType={objectType}
+              src={item.source_snapshot}
+              diffs={item.diffs}
+              targetMissing={false}
+            />
+          ) : item.status === "source_only" && item.source_snapshot ? (
+            <SnapshotView data={item.source_snapshot} objectType={objectType} />
+          ) : item.status === "target_only" && item.target_snapshot ? (
+            <SnapshotView data={item.target_snapshot} objectType={objectType} />
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 一个分类分组（如「内容不一致」）：可折叠，列出该类下所有对象行。
+function CompareGroup({
+  status,
+  items,
+  objectType,
+  defaultOpen,
+}: {
+  status: CompareStatus;
+  items: CompareItem[];
+  objectType: ObjectType;
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  if (items.length === 0) return null;
+  const meta = COMPARE_META[status];
+  return (
+    <div className="space-y-1">
+      <button
+        className="flex items-center gap-1 text-xs font-medium hover:opacity-80 transition-opacity"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        <span className={meta.cls}>{meta.label}</span>
+        <span className="text-muted-foreground/50">{items.length}</span>
+      </button>
+      {open && (
+        <div className="space-y-1 pl-1">
+          {items.map((it) => (
+            <CompareItemRow key={it.name} item={it} objectType={objectType} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CompareResultCard({
+  t,
+  objectType,
+  namesOnly,
+}: {
+  t: CompareTargetResult;
+  objectType: ObjectType;
+  namesOnly: boolean;
+}) {
+  // 仅名单：源/目标/都有三桶；内容：不一致/仅源/仅目标/一致四桶。
+  const groups: CompareStatus[] = namesOnly
+    ? ["source_only", "target_only", "error", "both"]
+    : ["different", "source_only", "target_only", "error", "identical"];
+  const byStatus = (s: CompareStatus) => t.items.filter((i) => i.status === s);
+  const hasNameDiff = t.source_only + t.target_only > 0;
+  return (
+    <div className="rounded-lg border p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-semibold">{t.instance_name}</span>
+        {t.error ? (
+          <Badge variant="destructive">读取失败</Badge>
+        ) : namesOnly ? (
+          hasNameDiff ? <Badge variant="warning">名单有差异</Badge> : <Badge variant="success">名单一致</Badge>
+        ) : t.different + t.error_count > 0 ? (
+          <Badge variant="warning">{t.different} 处不一致</Badge>
+        ) : hasNameDiff ? (
+          <Badge variant="warning">名单有差异</Badge>
+        ) : (
+          <Badge variant="success">{objectType === "policy" && !namesOnly ? "核心段一致" : "完全一致"}</Badge>
+        )}
+      </div>
+      {t.error && <p className="text-xs text-destructive">{t.error}</p>}
+      {!t.error && (
+        <>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            {namesOnly ? (
+              <>
+                <span>仅源有 <span className="text-emerald-400">{t.source_only}</span></span>
+                <span>仅目标有 <span className="text-sky-400">{t.target_only}</span></span>
+                <span>两边都有 <span className="text-muted-foreground/70">{t.both}</span></span>
+              </>
+            ) : (
+              <>
+                <span>不一致 <span className="text-amber-400">{t.different}</span></span>
+                <span>仅源有 <span className="text-emerald-400">{t.source_only}</span></span>
+                <span>仅目标有 <span className="text-sky-400">{t.target_only}</span></span>
+                <span>一致 <span className="text-muted-foreground/70">{t.identical}</span></span>
+              </>
+            )}
+            {t.error_count > 0 && <span>失败 <span className="text-red-400">{t.error_count}</span></span>}
+          </div>
+          {objectType === "policy" && !namesOnly && (
+            <p className="text-[11px] text-muted-foreground/60">
+              * 策略的「一致/不一致」仅就 <span className="text-muted-foreground/80">应用控制 / 端口控制 / 代理控制 + 启用状态</span> 判定，不含其余段（Web 过滤/邮件/QQ/SaaS 等）。
+            </p>
+          )}
+          <div className="space-y-1.5">
+            {groups.map((s) => (
+              <CompareGroup
+                key={s}
+                status={s}
+                items={byStatus(s)}
+                objectType={objectType}
+                defaultOpen={s !== "identical" && s !== "both"}
+              />
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── 主页面 ────────────────────────────────────────────────────────────────────
 
 export function SyncPage() {
@@ -696,18 +1156,24 @@ export function SyncPage() {
   const [resultKey, setResultKey] = useState<string | null>(null);
   // 真实写入二次确认弹窗：null 关闭，否则携带「是否一键推送全部 + 是否批量」
   const [confirmApply, setConfirmApply] = useState<{ pushAll: boolean; batch: boolean } | null>(null);
-  // 同步范围：单个对象 / 整类批量；镜像：删除目标多余对象
-  const [scope, setScope] = useState<"single" | "batch">("single");
+  // 意图：对比（只读，理解差异）/ 同步（写入，推送变更）——读写分离，写入口只在「同步」下出现
+  const [mode, setMode] = useState<"compare" | "sync">("compare");
+  // 镜像：删除目标多余对象（仅同步 + 全部对象）
   const [mirror, setMirror] = useState(false);
+  // 策略同步：允许写入「降级（丢弃了目标缺失引用、与源不等价）」的策略；默认关（后端会拒绝降级写入）
+  const [allowDegrade, setAllowDegrade] = useState(false);
   const [batchResult, setBatchResult] = useState<BatchSyncResult | null>(null);
+  const [compareResult, setCompareResult] = useState<BatchCompareResult | null>(null);
 
   const sourceName = instances.find((i) => i.id === sourceId)?.name ?? "源";
   const isPolicy = objectType === "policy";
-  const isBatch = scope === "batch";
+  // 范围（单个/全部）是对象选择框里的子选项：选「全部对象」哨兵即整类批量
+  const isBatch = objectName === ALL_OBJECTS;
+  const isCompare = mode === "compare";
 
-  // 当前配置指纹；与 resultKey 不一致即说明右侧预览已过期
+  // 当前配置指纹；与 resultKey 不一致即说明右侧结果已过期
   const currentKey = JSON.stringify({
-    scope, objectType, sourceId, objectName, mirror, targets: [...targets].sort(),
+    mode, objectType, sourceId, objectName, mirror, targets: [...targets].sort(),
   });
   const stale = resultKey != null && resultKey !== currentKey;
 
@@ -736,8 +1202,22 @@ export function SyncPage() {
         source_instance_id: sourceId!,
         target_instance_ids: targets,
       }),
-    onSuccess: (r) => { setDiff(r); setApplyResult(null); setResultKey(currentKey); },
+    onSuccess: (r) => { setDiff(r); setApplyResult(null); setCompareResult(null); setResultKey(currentKey); },
     onError: (e: any) => toast.error(e?.response?.data?.detail ?? "差异计算失败"),
+  });
+
+  // 只读对比（batch 模式）。namesOnly=true 只比名单（秒级）；false 比内容（四分类，较慢）。
+  const compareMut = useMutation({
+    mutationFn: ({ namesOnly, force }: { namesOnly: boolean; force?: boolean }) =>
+      syncApi.compare({
+        object_type: objectType,
+        source_instance_id: sourceId!,
+        target_instance_ids: targets,
+        names_only: namesOnly,
+        force: force ?? false,
+      }),
+    onSuccess: (r) => { setCompareResult(r); setBatchResult(null); setResultKey(currentKey); },
+    onError: (e: any) => toast.error(e?.response?.data?.detail ?? "对比失败"),
   });
 
   const applyMut = useMutation({
@@ -749,17 +1229,21 @@ export function SyncPage() {
         target_instance_ids: targets,
         push_all: pushAll,
         dry_run: dryRun,
+        allow_degrade: allowDegrade,
       }),
     onSuccess: (r, vars) => {
       setApplyResult(r);
+      setCompareResult(null);
       setResultKey(currentKey);
       setConfirmApply(null);
       if (vars.dryRun) {
         toast.success("已生成同步预览（dry-run）");
       } else {
         const failed = r.results.filter((x) => !x.success).length;
-        if (failed === 0) toast.success("同步完成");
-        else toast.warning(`同步完成，${failed} 个目标失败`);
+        const degraded = r.results.filter((x) => x.degraded && x.success).length;
+        if (failed > 0) toast.warning(`同步完成，${failed} 个目标失败/被拒绝`);
+        else if (degraded > 0) toast.warning(`同步完成，${degraded} 个为降级写入（与源不等价）`);
+        else toast.success("同步完成");
       }
     },
     onError: (e: any) => toast.error(e?.response?.data?.detail ?? "同步失败"),
@@ -774,9 +1258,11 @@ export function SyncPage() {
         push_all: pushAll,
         mirror,
         dry_run: dryRun,
+        allow_degrade: allowDegrade,
       }),
     onSuccess: (r, vars) => {
       setBatchResult(r);
+      setCompareResult(null);
       setResultKey(currentKey);
       setConfirmApply(null);
       const failed = r.targets.reduce((n, t) => n + t.failed.length, 0);
@@ -791,32 +1277,39 @@ export function SyncPage() {
     setTargets((t) => (t.includes(id) ? t.filter((x) => x !== id) : [...t, id]));
   }
 
-  const ready = isBatch ? sourceId != null : sourceId != null && objectName !== "";
+  const ready = sourceId != null && objectName !== "";
   const applying = applyMut.isPending || batchMut.isPending;
+  const comparing = compareMut.isPending;
+  // 当前意图 + 范围对应的结果：对比→字段差异 / 全量对比；同步→单对象写 / 批量写
+  const activeResult = isCompare ? (isBatch ? compareResult : diff) : isBatch ? batchResult : applyResult;
 
   return (
     <div className="space-y-5">
       <PageHeader
-        title="实例同步"
-        description="把单个对象或整类对象从源实例同步到其他实例：单个对象可预览字段级差异；批量可一次同步整类（可选镜像删除目标多余对象）。先预览、确认后再写入。"
+        title="实例对比与同步"
+        description="先「对比」理解两实例的差异（只读，不写设备），再「同步」把源推送到目标。两种意图分开：对比页只有对比按钮，写入口只在同步页出现。"
       />
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-[300px_1fr] lg:items-start">
         {/* 左：配置 */}
         <Card className="lg:sticky lg:top-4">
-          <CardHeader><CardTitle className="text-base">同步配置</CardTitle></CardHeader>
+          <CardHeader><CardTitle className="text-base">配置</CardTitle></CardHeader>
           <CardContent className="space-y-4">
-            {/* 同步范围：单个对象 / 整类批量 */}
+            {/* 意图：对比（只读）/ 同步（写入） */}
             <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted/40 p-1">
-              {(["single", "batch"] as const).map((s) => (
+              {(["compare", "sync"] as const).map((m) => (
                 <button
-                  key={s}
-                  onClick={() => setScope(s)}
+                  key={m}
+                  onClick={() => setMode(m)}
                   className={`rounded-md px-2 py-1.5 text-xs font-medium transition-colors ${
-                    scope === s ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                    mode === m
+                      ? m === "sync"
+                        ? "bg-background text-amber-500 shadow-sm"
+                        : "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
-                  {s === "single" ? "单个对象" : "全部对象（批量）"}
+                  {m === "compare" ? "对比（只读）" : "同步（写入）"}
                 </button>
               ))}
             </div>
@@ -829,6 +1322,12 @@ export function SyncPage() {
                   {OBJECT_TYPES.map((t) => <SelectItem key={t.value} value={t.value}>{t.label}</SelectItem>)}
                 </SelectContent>
               </Select>
+              {isPolicy && (
+                <p className="text-[11px] text-muted-foreground/70">
+                  策略仅对比 <span className="text-foreground/70">应用控制 / 端口控制 / 代理控制</span> 三段及启用状态；
+                  其余段（Web 关键字/文件类型过滤、邮件、QQ、SaaS 等）不参与对比，也不在差异里显示。
+                </p>
+              )}
             </div>
 
             <div className="space-y-1.5">
@@ -841,29 +1340,31 @@ export function SyncPage() {
               </Select>
             </div>
 
-            {!isBatch && (
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">
-                  对象名称 {names.isFetching && <Spinner className="ml-1 inline" />}
-                </Label>
-                <Combobox
-                  options={(names.data ?? []).map((n) => ({ value: n, label: n }))}
-                  value={objectName}
-                  onChange={setObjectName}
-                  disabled={sourceId == null}
-                  placeholder={sourceId == null ? "请先选择源实例" : "选择要同步的对象"}
-                  searchPlaceholder="输入关键字搜索…"
-                  emptyText="无匹配对象"
-                />
-              </div>
-            )}
-
-            {isBatch && (
-              <div className="text-xs text-muted-foreground">
-                将同步源实例的<span className="text-foreground/80">全部{OBJECT_TYPES.find((t) => t.value === objectType)?.label}</span>
-                {sourceId != null && names.data && <span>（共 {names.data.length} 个）</span>}到所选目标。
-              </div>
-            )}
+            {/* 范围作为对象选择框的子选项：首项「全部对象」= 整类批量，其余为具体对象 */}
+            <div className="space-y-1.5">
+              <Label className="text-xs text-muted-foreground">
+                {isCompare ? "对比范围" : "同步范围"} {names.isFetching && <Spinner className="ml-1 inline" />}
+              </Label>
+              <Combobox
+                options={[
+                  { value: ALL_OBJECTS, label: `全部对象（${names.data?.length ?? 0} 个）` },
+                  ...(names.data ?? []).map((n) => ({ value: n, label: n })),
+                ]}
+                value={objectName}
+                onChange={setObjectName}
+                disabled={sourceId == null}
+                placeholder={sourceId == null ? "请先选择源实例" : "选择「全部对象」或某个具体对象"}
+                searchPlaceholder="输入关键字搜索…"
+                emptyText="无匹配对象"
+              />
+              {isBatch && (
+                <p className="text-[11px] text-muted-foreground">
+                  {isCompare ? "将对比源与目标的" : "将把源的"}
+                  <span className="text-foreground/70">全部{OBJECT_TYPES.find((t) => t.value === objectType)?.label}</span>
+                  {isCompare ? "（名单 + 内容）。" : "写入所选目标。"}
+                </p>
+              )}
+            </div>
 
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">目标实例</Label>
@@ -884,7 +1385,7 @@ export function SyncPage() {
               </div>
             </div>
 
-            {isBatch && (
+            {isBatch && !isCompare && (
               <div className="flex items-center justify-between rounded-lg border border-amber-500/25 bg-amber-500/[0.05] px-3 py-2">
                 <div className="space-y-0.5">
                   <Label className="text-xs font-medium text-amber-300/90">镜像模式</Label>
@@ -895,35 +1396,79 @@ export function SyncPage() {
             )}
 
             <div className="flex flex-wrap gap-2 pt-2">
-              {!isBatch && (
-                <Button variant="outline" onClick={() => diffMut.mutate()} disabled={!ready || targets.length === 0 || diffMut.isPending}>
-                  {diffMut.isPending ? <Spinner /> : <GitCompareArrows className="h-4 w-4" />}
-                  预览差异
-                </Button>
+              {isCompare ? (
+                // 对比（只读）：无写按钮。单对象→字段级差异；全部对象→「只对比名称」/「对比名称和内容」二选一。
+                isBatch ? (
+                  <>
+                    <Button
+                      variant="outline"
+                      onClick={() => compareMut.mutate({ namesOnly: true })}
+                      disabled={!ready || targets.length === 0 || comparing}
+                      title="只比对象名单：仅源有 / 仅目标有 / 两边都有（不拉详情，秒级）"
+                    >
+                      {comparing && compareMut.variables?.namesOnly === true ? <Spinner /> : <Scale className="h-4 w-4" />}
+                      只对比名称
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => compareMut.mutate({ namesOnly: false })}
+                      disabled={!ready || targets.length === 0 || comparing}
+                      title="比名单 + 内容：仅源有 / 仅目标有 / 一致 / 不一致（逐对象拉详情，较慢）"
+                    >
+                      {comparing && compareMut.variables?.namesOnly === false ? <Spinner /> : <GitCompareArrows className="h-4 w-4" />}
+                      对比名称和内容
+                    </Button>
+                  </>
+                ) : (
+                  <Button
+                    variant="outline"
+                    onClick={() => diffMut.mutate()}
+                    disabled={!ready || targets.length === 0 || diffMut.isPending}
+                    title="比源与目标该对象的字段级差异，不写设备"
+                  >
+                    {diffMut.isPending ? <Spinner /> : <Scale className="h-4 w-4" />}
+                    开始对比
+                  </Button>
+                )
+              ) : (
+                // 同步（写入）：先「同步预览」看将执行什么（dry-run），再确认写入。
+                <>
+                  <Button
+                    variant="outline"
+                    onClick={() =>
+                      isBatch
+                        ? batchMut.mutate({ pushAll: false, dryRun: true })
+                        : applyMut.mutate({ pushAll: false, dryRun: true })
+                    }
+                    disabled={!ready || targets.length === 0 || applying}
+                    title="dry-run：只算并展示将执行的写操作（新增/覆盖/删除），不改设备"
+                  >
+                    {applying ? <Spinner /> : <GitCompareArrows className="h-4 w-4" />}
+                    同步预览
+                  </Button>
+                  <Button onClick={() => setConfirmApply({ pushAll: false, batch: isBatch })} disabled={!ready || targets.length === 0 || applying}>
+                    <ArrowRight className="h-4 w-4" />
+                    {isBatch ? "批量同步到所选" : "同步到所选目标"}
+                  </Button>
+                  <Button variant="secondary" onClick={() => setConfirmApply({ pushAll: true, batch: isBatch })} disabled={!ready || applying}>
+                    <Rocket className="h-4 w-4" />
+                    一键推送到全部
+                  </Button>
+                </>
               )}
-              {isBatch && (
-                <Button variant="outline" onClick={() => batchMut.mutate({ pushAll: false, dryRun: true })} disabled={!ready || targets.length === 0 || applying}>
-                  {batchMut.isPending ? <Spinner /> : <GitCompareArrows className="h-4 w-4" />}
-                  预览批量
-                </Button>
-              )}
-              <Button onClick={() => setConfirmApply({ pushAll: false, batch: isBatch })} disabled={!ready || targets.length === 0 || applying}>
-                <ArrowRight className="h-4 w-4" />
-                {isBatch ? "批量同步到所选" : "同步到所选目标"}
-              </Button>
-              <Button variant="secondary" onClick={() => setConfirmApply({ pushAll: true, batch: isBatch })} disabled={!ready || applying}>
-                <Rocket className="h-4 w-4" />
-                一键推送到全部
-              </Button>
             </div>
           </CardContent>
         </Card>
 
-        {/* 右：差异 / 结果 */}
+        {/* 右：对比 / 同步 结果 */}
         <Card>
           <CardHeader>
             <CardTitle className="text-base">
-              {isBatch
+              {isCompare
+                ? isBatch
+                  ? "全部对象对比（只读）"
+                  : "单个对象对比（只读）"
+                : isBatch
                 ? batchResult
                   ? batchResult.targets.some((t) => !t.dry_run)
                     ? "批量同步结果"
@@ -933,30 +1478,89 @@ export function SyncPage() {
                 ? applyResult.results.some((r) => !r.dry_run)
                   ? "同步结果"
                   : "同步预览（dry-run）"
-                : "差异预览"}
+                : "同步"}
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            {/* 配置已变更：保留上次预览但标记过期，提示重新预览 */}
-            {stale && (diff || applyResult || batchResult) && (
+            {/* 配置已变更：保留上次结果但标记过期，提示重新执行 */}
+            {stale && activeResult && (
               <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-xs">
-                <span className="text-amber-300/90">配置已变更，下方为上一次的预览结果（已过期）。</span>
+                <span className="text-amber-300/90">配置已变更，下方为上一次的结果（已过期）。</span>
                 <Button
                   size="sm"
                   variant="outline"
                   className="h-7 shrink-0"
-                  onClick={() => (isBatch ? batchMut.mutate({ pushAll: false, dryRun: true }) : diffMut.mutate())}
-                  disabled={!ready || targets.length === 0 || diffMut.isPending || batchMut.isPending}
+                  onClick={() =>
+                    isCompare
+                      ? isBatch
+                        ? compareMut.mutate({ namesOnly: compareResult?.names_only ?? false })
+                        : diffMut.mutate()
+                      : isBatch
+                      ? batchMut.mutate({ pushAll: false, dryRun: true })
+                      : applyMut.mutate({ pushAll: false, dryRun: true })
+                  }
+                  disabled={!ready || targets.length === 0 || diffMut.isPending || applying || comparing}
                 >
-                  {diffMut.isPending || batchMut.isPending ? <Spinner /> : <RefreshCw className="h-3.5 w-3.5" />}
-                  重新预览
+                  {diffMut.isPending || applying || comparing ? <Spinner /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  {isCompare ? "重新对比" : "重新预览"}
                 </Button>
               </div>
             )}
 
             <div className={stale ? "pointer-events-none opacity-40 transition-opacity" : "transition-opacity"}>
               <div className="space-y-3">
-                {isBatch ? (
+                {isCompare ? (
+                  isBatch ? (
+                    compareResult ? (
+                      <>
+                        <div className="text-xs text-muted-foreground">
+                          源共 {compareResult.source_count} 个对象 ·{" "}
+                          {compareResult.names_only
+                            ? "只对比名称（仅比对象名单，未拉内容）"
+                            : "对比名称和内容（逐对象，只读不写设备）"}
+                          {!compareResult.names_only && compareResult.source_cached && (
+                            <span className="text-amber-500/80" title="源快照来自缓存；写操作后或缓存过期会自动重取">
+                              {" "}· 源快照缓存{
+                                compareResult.source_cache_age_seconds < 60
+                                  ? "刚刚"
+                                  : `${Math.floor(compareResult.source_cache_age_seconds / 60)}分钟前`
+                              }
+                            </span>
+                          )}
+                        </div>
+                        {compareResult.targets.map((t) => (
+                          <CompareResultCard
+                            key={t.instance_id}
+                            t={t}
+                            objectType={objectType}
+                            namesOnly={compareResult.names_only}
+                          />
+                        ))}
+                      </>
+                    ) : (
+                      <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+                        配置左侧后点击「只对比名称」或「对比名称和内容」
+                      </div>
+                    )
+                  ) : diff ? (
+                    <>
+                      <SourceSummary data={diff.source_snapshot as Record<string, unknown>} objectType={objectType} />
+                      {diff.targets.map((t) => (
+                        <TargetCard
+                          key={t.instance_id}
+                          t={t}
+                          src={diff.source_snapshot as Record<string, unknown>}
+                          objectType={objectType}
+                          sourceName={sourceName}
+                        />
+                      ))}
+                    </>
+                  ) : (
+                    <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+                      配置左侧后点击「开始对比」
+                    </div>
+                  )
+                ) : isBatch ? (
                   batchResult ? (
                     <>
                       <div className="text-xs text-muted-foreground">
@@ -966,27 +1570,14 @@ export function SyncPage() {
                     </>
                   ) : (
                     <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
-                      配置左侧后点击「预览批量」
+                      配置左侧后点击「同步预览」，或直接「批量同步 / 一键推送」（会先弹确认）
                     </div>
                   )
                 ) : applyResult ? (
                   applyResult.results.map((r) => <ApplyResultCard key={r.instance_id} r={r} />)
-                ) : diff ? (
-                  <>
-                    <SourceSummary data={diff.source_snapshot as Record<string, unknown>} objectType={objectType} />
-                    {diff.targets.map((t) => (
-                      <TargetCard
-                        key={t.instance_id}
-                        t={t}
-                        src={diff.source_snapshot as Record<string, unknown>}
-                        objectType={objectType}
-                        sourceName={sourceName}
-                      />
-                    ))}
-                  </>
                 ) : (
                   <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
-                    配置左侧后点击「预览差异」
+                    配置左侧后点击「同步预览」，或直接「同步 / 一键推送」（会先弹确认）
                   </div>
                 )}
               </div>
@@ -1042,9 +1633,23 @@ export function SyncPage() {
                     </div>
                   )}
                   {isPolicy && (
-                    <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-xs text-amber-300/90">
-                      访问权限策略会按目标设备的 crc 重建报文写入：目标缺少的「自定义」应用 / URL 库会自动先建到目标；
-                      「内置」对象在目标缺失则无法创建，会跳过这些引用、尽可能同步其余内容（结果会列出跳过项）。建议先「仅预览」核对。
+                    <div className="space-y-2">
+                      <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-xs text-amber-300/90">
+                        访问权限策略会按目标设备的 crc 重建报文写入：目标缺少的「自定义」应用 / URL 库会自动先建到目标；
+                        但若目标有<span className="font-medium">无法解析的引用</span>（内置对象缺失、或自定义引用创建失败），丢掉它会写出与源<span className="font-medium">不等价（降级）</span>的策略（如拒绝规则少挡了对象=安全缺口）。此时<span className="font-medium">默认拒绝写入策略</span>（已建的自定义对象会保留在目标）。建议先「仅预览」核对。
+                      </div>
+                      <label className="flex items-start gap-2 rounded-md border border-rose-500/25 bg-rose-500/[0.05] px-3 py-2 text-xs text-rose-300/90">
+                        <input
+                          type="checkbox"
+                          checked={allowDegrade}
+                          onChange={(e) => setAllowDegrade(e.target.checked)}
+                          className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-rose-500"
+                        />
+                        <span>
+                          <span className="font-medium">允许降级同步</span>：目标有无法解析的引用（内置缺失或自定义引用创建失败）时，仍写入丢弃了这些引用的
+                          <span className="font-medium">不等价版本</span>（不勾则遇到此情况会被拒绝、不写策略）。
+                        </span>
+                      </label>
                     </div>
                   )}
                 </div>

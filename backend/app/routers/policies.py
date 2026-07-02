@@ -12,9 +12,10 @@ from app.db.base import get_db
 from app.db.models import Instance
 from app.routers.deps import get_instance_dep
 from app.sangfor.web_client import SangforWebError
+from app.schemas.analysis import PolicyUsageResult
 from app.schemas.common import WriteResult
 from app.schemas.policy import PolicyApplicationUpdate, PolicyCreate, PolicyStatusUpdate
-from app.services import policy_service
+from app.services import policy_service, policy_usage_service
 
 router = APIRouter(prefix="/api/instances/{instance_id}/policies", tags=["policies"])
 
@@ -35,6 +36,18 @@ def list_app_tree(instance: Instance = Depends(get_instance_dep)):
     """
     try:
         return policy_service.list_app_tree(instance)
+    except SangforWebError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.get("/usage", response_model=PolicyUsageResult)
+def policy_usage(refresh: bool = False, instance: Instance = Depends(get_instance_dep)):
+    """策略引用校验：统计每条访问权限策略被多少用户引用，标出无人引用的。
+
+    需遍历组织树逐组拉用户，开销大；结果带服务端 TTL 缓存，``refresh=true`` 强制重算。
+    """
+    try:
+        return policy_usage_service.analyze_policy_usage(instance, force=refresh)
     except SangforWebError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 

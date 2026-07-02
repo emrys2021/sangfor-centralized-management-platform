@@ -4,7 +4,8 @@
 
 用于「策略引用校验」：遍历组织树各组，取每个组的**用户**（``org:false`` 行）及其
 设备算好的**生效策略**（``strategy``，已含组默认 + 用户添加 − 排除），据此统计每条访问
-权限策略被多少用户引用、找出无人引用的策略。
+权限策略被多少用户引用、找出无人引用的策略。同时返回**子组行**（``org:true``）的
+生效策略，用于把用户的「继承所属组」占位符展开为组的实际策略（见 ``list_org_members``）。
 """
 from __future__ import annotations
 
@@ -36,13 +37,19 @@ class OrgCgiMixin:
         walk(result.get("data") or {})
         return nodes
 
-    def list_org_members(self, org_id: str, *, page_size: int = 2000) -> list[dict]:
-        """返回某组的直接成员**用户**（``org:false`` 行）及其生效策略，自动翻页。
+    def list_org_members(self, org_id: str, *, page_size: int = 2000) -> dict:
+        """返回某组的直接子项：**用户**（``org:false``）与**子组**（``org:true``），自动翻页。
 
-        返回 ``[{name, strategy, status}]``，``strategy`` 为逗号分隔的生效策略名串
-        （设备已算好默认 + 添加 − 排除）；子组（``org:true``）被跳过。
+        返回 ``{"users": [{name, strategy, status}], "subgroups": [{id, name, strategy}]}``：
+
+        - ``users`` 的 ``strategy`` 是设备算好的生效策略串（默认 + 添加 − 排除）；但部分固件
+          （如深圳 AC）对「完全继承所属组、无个人改动」的用户，用户行 ``strategy`` 只写占位符
+          ``"与所属组相同"``，真正的策略清单落在该组作为**子组行**出现在其**父组**列表里。
+        - 故这里同时返回子组行（``org:true``）的 ``id`` 与 ``strategy``，供上层建立
+          ``组id → 生效策略`` 映射、把用户的「继承占位」展开为所属组的实际策略。
         """
         users: list[dict] = []
+        subgroups: list[dict] = []
         start = 0
         while True:
             body = {
@@ -60,7 +67,17 @@ class OrgCgiMixin:
             if not isinstance(rows, list):
                 break
             for row in rows:
-                if isinstance(row, dict) and not row.get("org"):  # 跳过子组，只收用户
+                if not isinstance(row, dict):
+                    continue
+                if row.get("org"):  # 子组行：带该组的生效策略
+                    subgroups.append(
+                        {
+                            "id": str(row.get("id", "") or ""),
+                            "name": row.get("name", ""),
+                            "strategy": row.get("strategy", "") or "",
+                        }
+                    )
+                else:  # 用户行
                     users.append(
                         {
                             "name": row.get("name", ""),
@@ -72,4 +89,4 @@ class OrgCgiMixin:
             start += len(rows)
             if not rows or start >= total or len(rows) < page_size:
                 break
-        return users
+        return {"users": users, "subgroups": subgroups}

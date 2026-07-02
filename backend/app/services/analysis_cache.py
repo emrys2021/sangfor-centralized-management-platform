@@ -89,10 +89,20 @@ class TTLCache:
 analysis_cache = TTLCache(settings.analysis_cache_ttl)
 # 全局搜索索引缓存：按实例 id 缓存「应用 IP/域名 + URL 库条目」索引（构建同样需逐条访问设备）。
 search_cache = TTLCache(settings.analysis_cache_ttl)
+# 策略引用校验缓存：按实例 id 缓存「策略 → 引用用户数」（需遍历组织树逐组拉用户，开销大）。
+policy_usage_cache = TTLCache(settings.analysis_cache_ttl)
+# 全量对比快照缓存：按 (实例 id, 对象类型) 缓存「该类全部对象的规范化快照」（逐对象 listItem，开销大）。
+snapshot_cache = TTLCache(settings.analysis_cache_ttl)
+
+# 全量对比涉及的对象类型（用于按实例失效快照缓存的所有类型条目）。
+_SNAPSHOT_OBJECT_TYPES = ("customrule", "url", "policy")
 
 
 def invalidate_instance(instance_id: int | None) -> None:
-    """写操作后使该实例的分析缓存与搜索索引缓存失效。``instance_id`` 为空时忽略。"""
+    """写操作后使该实例的分析 / 搜索 / 策略引用 / 对比快照缓存失效。``instance_id`` 为空时忽略。"""
     if instance_id is not None:
         analysis_cache.invalidate(instance_id)
         search_cache.invalidate(instance_id)
+        policy_usage_cache.invalidate(instance_id)
+        for object_type in _SNAPSHOT_OBJECT_TYPES:
+            snapshot_cache.invalidate((instance_id, object_type))

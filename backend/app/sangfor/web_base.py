@@ -20,7 +20,31 @@ import rsa
 import urllib3
 from requests.adapters import HTTPAdapter
 
+from app.config import settings
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# ------------------------------------------------------------------------- #
+# 全局并发限流：限制对**同一台 AC**（按 origin）的在途 CGI 请求数，跨请求生效。
+# 各分析/对比/搜索单次请求内部虽已用线程池并行（大小 = settings.fetch_concurrency），但多个
+# 请求同时跑会叠加；这里用 per-origin 信号量把对单台设备的实际并发封顶到
+# ``settings.global_fetch_concurrency``，避免高峰压垮设备。
+# ------------------------------------------------------------------------- #
+_host_sems: dict[str, threading.BoundedSemaphore] = {}
+_host_sems_lock = threading.Lock()
+
+
+def _host_semaphore(origin: str) -> threading.BoundedSemaphore:
+    """取（或惰性创建）某台 AC 的全局并发信号量。"""
+    sem = _host_sems.get(origin)
+    if sem is None:
+        with _host_sems_lock:
+            sem = _host_sems.get(origin)
+            if sem is None:
+                sem = threading.BoundedSemaphore(max(1, int(settings.global_fetch_concurrency)))
+                _host_sems[origin] = sem
+    return sem
 
 
 class _LegacyTLSAdapter(HTTPAdapter):
@@ -235,13 +259,15 @@ class SangforWebBase:
         url = f"{self.origin}/{path.lstrip('/')}"
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
-            r = self.session.post(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json; charset=utf-8"},
-                verify=self.verify,
-                timeout=self.timeout,
-            )
+            # 全局限流：同一台 AC 的在途 CGI 请求数不超过 settings.fetch_concurrency
+            with _host_semaphore(self.origin):
+                r = self.session.post(
+                    url,
+                    data=data,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                    verify=self.verify,
+                    timeout=self.timeout,
+                )
         except requests.RequestException as exc:
             raise SangforWebError(f"网络请求失败（{path}）：{exc}") from exc
         r.encoding = r.apparent_encoding

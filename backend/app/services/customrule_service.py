@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.core import audit
 from app.core.auth import CurrentUser
 from app.db.models import Instance
@@ -178,7 +179,7 @@ def _compute_analysis(instance: Instance) -> dict:
 
     # 每个自定义应用需一次 listItem 调用，应用多时串行很慢，用线程池并发拉取。
     # 每个 worker 用 web.clone_session() 的独立 session，规避 requests.Session 非线程安全。
-    max_workers = min(8, max(1, len(rules)))
+    max_workers = min(settings.fetch_concurrency, max(1, len(rules)))
     with ThreadPoolExecutor(max_workers=max_workers, initializer=_init_worker, initargs=(web,)) as pool:
         results = list(pool.map(fetch, rules))
 

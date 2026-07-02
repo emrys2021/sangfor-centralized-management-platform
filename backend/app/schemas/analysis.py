@@ -64,6 +64,28 @@ class PolicyUrlLink(BaseModel):
     action: str = "unknown"
 
 
+class PolicyUsageItem(BaseModel):
+    """一条访问权限策略的引用情况。"""
+
+    name: str
+    depict: str = ""
+    founder: str = ""
+    status: bool = True
+    order: int = 0
+    user_count: int = 0  # 引用此策略的用户数（0 = 无人使用）
+    used: bool = True
+
+
+class PolicyUsageResult(BaseModel):
+    policies: list[PolicyUsageItem] = []
+    total_policies: int = 0
+    unused_count: int = 0
+    total_users: int = 0
+    errors: list[str] = []
+    cached: bool = False
+    cache_age_seconds: int | None = None
+
+
 class CustomRuleAnalysis(BaseModel):
     total_apps: int
     analyzed_apps: int

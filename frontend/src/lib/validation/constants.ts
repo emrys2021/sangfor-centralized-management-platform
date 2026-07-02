@@ -17,6 +17,6 @@ export const ACTION_UNKNOWN_COLOR = "#94a3b8";
 export const KEY_SEPARATOR = "\u001f";
 export const FIXED_SANKEY_NODE_VALUE = 1;
 
-export type ValidationView = "app-sankey" | "url-sankey" | "graph";
+export type ValidationView = "app-sankey" | "url-sankey" | "graph" | "policy-usage";
 export type AppSankeyPrimary = "policy" | "app";
 export type UrlSankeyPrimary = "policy" | "url";
