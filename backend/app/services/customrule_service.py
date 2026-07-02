@@ -125,9 +125,16 @@ def update_rule(
 
 def delete_rule(db: Session, user: CurrentUser, instance: Instance, rule_name: str, dry_run: bool):
     web = session_pool.get_web_client(instance)
+    # 真实删除前留完整详情快照进审计 before（尽力而为），误删后可按快照内容重建；预览不读
+    before = None
+    if not dry_run:
+        try:
+            before = web.get_custom_rule_detail(rule_name)
+        except Exception:  # noqa: BLE001  快照读不到不阻断删除本身
+            pass
     result = web.delete_custom_rule(rule_name, dry_run=dry_run)
     _audit(
-        db, user, instance, "dry_run" if dry_run else "delete", rule_name, result,
+        db, user, instance, "dry_run" if dry_run else "delete", rule_name, result, before,
         message=f"删除自定义应用「{rule_name}」",
     )
     if not dry_run:

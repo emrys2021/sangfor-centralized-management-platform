@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight, GitCompareArrows, RefreshCw, Rocket, Scale } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
@@ -43,6 +43,32 @@ const OBJECT_TYPES: { value: ObjectType; label: string }[] = [
 // 对象选择框里的特殊项：选它表示「整类全部对象」（对比/同步 的批量子选项）。
 // 用不可能与真实对象名冲突的哨兵值。
 const ALL_OBJECTS = "__ALL_OBJECTS__";
+
+// sync-names 按 [对象类型, 实例id] 缓存；策略同步可能顺带在目标自动建/改自定义应用或 URL 库
+// 引用（见 policy_sync 的自动建引用），故失效时三种类型都覆盖，不只当次同步的 objectType。
+const ALL_OBJECT_TYPES: ObjectType[] = ["customrule", "url", "policy"];
+
+/** 真实同步写入后失效目标实例的相关前端缓存。
+ *
+ * 全局 staleTime=30s/5min（见 main.tsx、app-picker.tsx 的应用树）后，切到目标实例页面短时间内
+ * 会直接读旧缓存——同步刚写完立刻去目标实例核对结果、或打开策略编辑器选应用是常见操作，必须
+ * 主动失效，否则会看到「同步成功但页面/应用树没变」的假象。TanStack Query 默认按前缀匹配，故
+ * 这里只传各 query 的前几段 key 即可覆盖其带详情名的变体（如 ["policy", id] 一并失效
+ * ["policy", id, name]）。
+ */
+function invalidateTargetInstanceQueries(qc: ReturnType<typeof useQueryClient>, instanceId: number) {
+  qc.invalidateQueries({ queryKey: ["policies", instanceId] });
+  qc.invalidateQueries({ queryKey: ["policy", instanceId] });
+  qc.invalidateQueries({ queryKey: ["app-tree", instanceId] });
+  qc.invalidateQueries({ queryKey: ["customrules", instanceId] });
+  qc.invalidateQueries({ queryKey: ["customrule", instanceId] });
+  qc.invalidateQueries({ queryKey: ["urls", instanceId] });
+  qc.invalidateQueries({ queryKey: ["url-content", instanceId] });
+  qc.invalidateQueries({ queryKey: ["cr-analysis", instanceId] });
+  qc.invalidateQueries({ queryKey: ["policy-usage", instanceId] });
+  qc.invalidateQueries({ queryKey: ["search", instanceId] });
+  for (const ot of ALL_OBJECT_TYPES) qc.invalidateQueries({ queryKey: ["sync-names", ot, instanceId] });
+}
 
 // ── 字段元数据 ────────────────────────────────────────────────────────────────
 
@@ -163,8 +189,7 @@ function ListDiff({
 // ── 策略规则级对比 ────────────────────────────────────────────────────────────
 
 type AppRef = { path: string; custom: boolean };
-type UrlRef = { name: string; custom: boolean };
-type PolicyRule = { name: string; action: string; apps: AppRef[]; urls: UrlRef[] };
+type PolicyRule = { name: string; action: string; apps: AppRef[] };
 type NetRule = { dip: string; service: string; action: unknown; time: string };
 
 function asRules(val: unknown): PolicyRule[] {
@@ -176,11 +201,6 @@ function asRules(val: unknown): PolicyRule[] {
     apps: Array.isArray(r?.apps)
       ? r.apps.map((a: any) =>
           typeof a === "string" ? { path: a, custom: false } : { path: String(a?.path ?? ""), custom: !!a?.custom }
-        )
-      : [],
-    urls: Array.isArray(r?.urls)
-      ? r.urls.map((u: any) =>
-          typeof u === "string" ? { name: u, custom: false } : { name: String(u?.name ?? ""), custom: !!u?.custom }
         )
       : [],
   }));
@@ -202,6 +222,12 @@ function actionText(a: unknown): string {
   if (a === "deny" || a === false || a === 0) return "拒绝";
   return String(a ?? "未知");
 }
+// 「访问网站/库名/能力」这类应用路径本质是 URL 库引用（可能是自定义库也可能是内置库，
+// 库名本身无法可靠判断内置/自定义，故不再区分），展示时从「应用」里拆出来单独归入「URL库」，
+// 显示完整路径；不用后端 urls 字段（裁剪成裸库名、且会和这里的完整路径重复显示同一条引用）。
+function isUrlRef(path: string): boolean {
+  return path.startsWith("访问网站/");
+}
 function netRuleText(r: NetRule): string {
   const t = r.time && r.time !== "全天" ? ` · ${r.time}` : "";
   return `${r.dip} · ${r.service} · ${actionText(r.action)}${t}`;
@@ -216,13 +242,10 @@ function targetVal(diffs: FieldDiff[], field: string, fallback: unknown): unknow
 function sameKeys(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((x) => b.includes(x));
 }
-// 规则一致 = 动作相同 且 引用应用/URL 相同
+// 规则一致 = 动作相同 且 引用应用/URL 相同（URL 库引用即「访问网站/…」路径，含在 apps 里，
+// 已是完整路径，不需要再单独比对后端裁剪成裸库名的 urls 字段——与展示层保持一致）。
 function ruleEq(s: PolicyRule, t: PolicyRule): boolean {
-  return (
-    s.action === t.action &&
-    sameKeys(s.apps.map((a) => a.path), t.apps.map((a) => a.path)) &&
-    sameKeys(s.urls.map((u) => u.name), t.urls.map((u) => u.name))
-  );
+  return s.action === t.action && sameKeys(s.apps.map((a) => a.path), t.apps.map((a) => a.path));
 }
 
 // 统计策略实际差异处数：规则级（新增/变更/目标多出，含动作差异）+ 段/策略级标量（启用、各段开关、
@@ -266,14 +289,22 @@ const REF_STATE_CLS: Record<RefState, string> = {
   same: "text-muted-foreground/60",
 };
 
-// 一类引用（如「自定义应用」）：列出条目，按状态着色
-function CategoryRow({ label, items }: { label: string; items: { value: string; state: RefState }[] }) {
+// 一类引用（如「自定义应用」）：列出条目，按状态着色。showCount=false 时不显示数量（用于「动作」行）。
+function CategoryRow({
+  label,
+  items,
+  showCount = true,
+}: {
+  label: string;
+  items: { value: string; state: RefState }[];
+  showCount?: boolean;
+}) {
   if (items.length === 0) return null;
   return (
     <div className="grid grid-cols-[80px_1fr] gap-2 text-xs">
       <span className="text-muted-foreground/50 whitespace-nowrap">
         {label}
-        <span className="text-muted-foreground/30">（{items.length}）</span>
+        {showCount && <span className="text-muted-foreground/30">（{items.length}）</span>}
       </span>
       <span className="flex flex-wrap gap-x-2 gap-y-0.5">
         {items.map((it, i) => (
@@ -377,27 +408,25 @@ function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown
 
         const srcApps = s?.apps ?? [];
         const tgtApps = effTg?.apps ?? [];
-        const srcUrls = s?.urls ?? [];
-        const tgtUrls = effTg?.urls ?? [];
         const pick = <T,>(arr: T[], f: (x: T) => boolean) => arr.filter(f);
         const customApps = diffCategory(
-          pick(srcApps, (a) => a.custom).map((a) => a.path),
-          pick(tgtApps, (a) => a.custom).map((a) => a.path)
+          pick(srcApps, (a) => a.custom && !isUrlRef(a.path)).map((a) => a.path),
+          pick(tgtApps, (a) => a.custom && !isUrlRef(a.path)).map((a) => a.path)
         );
         const builtinApps = diffCategory(
-          pick(srcApps, (a) => !a.custom).map((a) => a.path),
-          pick(tgtApps, (a) => !a.custom).map((a) => a.path)
+          pick(srcApps, (a) => !a.custom && !isUrlRef(a.path)).map((a) => a.path),
+          pick(tgtApps, (a) => !a.custom && !isUrlRef(a.path)).map((a) => a.path)
         );
-        const customUrls = diffCategory(
-          pick(srcUrls, (u) => u.custom).map((u) => u.name),
-          pick(tgtUrls, (u) => u.custom).map((u) => u.name)
+        const urlRefs = diffCategory(
+          pick(srcApps, (a) => isUrlRef(a.path)).map((a) => a.path),
+          pick(tgtApps, (a) => isUrlRef(a.path)).map((a) => a.path)
         );
-        const builtinUrls = diffCategory(
-          pick(srcUrls, (u) => !u.custom).map((u) => u.name),
-          pick(tgtUrls, (u) => !u.custom).map((u) => u.name)
+        const empty = customApps.length + builtinApps.length + urlRefs.length === 0;
+        // 动作也用引用条目同一套 diff 着色：源动作=绿(将加到目标)、目标旧动作=红删除线(将删)、一致=灰
+        const actionItems = diffCategory(
+          s ? [actionText(s.action)] : [],
+          effTg ? [actionText(effTg.action)] : []
         );
-        const empty =
-          customApps.length + builtinApps.length + customUrls.length + builtinUrls.length === 0;
 
         const border = isExtra
           ? "border-red-500/20 bg-red-500/[0.06]"
@@ -430,43 +459,20 @@ function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown
               ) : (
                 <span className="text-[10px] text-muted-foreground/40">一致</span>
               )}
-              {(() => {
-                const sa = s?.action;
-                const ta = effTg?.action;
-                if (s && effTg && sa !== ta)
-                  return (
-                    <span className="text-[10px]">
-                      <span className="text-emerald-400">{actionText(sa)}</span>
-                      <span className="mx-0.5 text-muted-foreground/40">→</span>
-                      <span className="text-red-400">{actionText(ta)}</span>
-                    </span>
-                  );
-                const a = (s ?? tg)?.action;
-                return a !== undefined ? (
-                  <span
-                    className={
-                      a === "deny"
-                        ? "text-[10px] text-red-400/80"
-                        : a === "allow"
-                        ? "text-[10px] text-emerald-400/80"
-                        : "text-[10px] text-muted-foreground/50"
-                    }
-                  >
-                    {actionText(a)}
-                  </span>
-                ) : null;
-              })()}
             </div>
-            {empty ? (
-              <p className="text-muted-foreground/40">（无应用 / URL 引用）</p>
-            ) : (
-              <div className="space-y-0.5">
-                <CategoryRow label="自定义应用" items={customApps} />
-                <CategoryRow label="内置应用" items={builtinApps} />
-                <CategoryRow label="自定义URL库" items={customUrls} />
-                <CategoryRow label="内置URL库" items={builtinUrls} />
-              </div>
-            )}
+            <div className="space-y-0.5">
+              {/* 动作下沉为一行，与引用条目用同一套 diff 着色（源绿/目标红删除线/一致灰） */}
+              <CategoryRow label="动作" items={actionItems} showCount={false} />
+              {empty ? (
+                <p className="text-muted-foreground/40 text-xs">（无应用 / URL 引用）</p>
+              ) : (
+                <>
+                  <CategoryRow label="自定义应用" items={customApps} />
+                  <CategoryRow label="内置应用" items={builtinApps} />
+                  <CategoryRow label="URL库" items={urlRefs} />
+                </>
+              )}
+            </div>
           </div>
         );
             })}
@@ -718,13 +724,18 @@ function snapshotChips(data: Record<string, unknown>, objectType: ObjectType): {
     if (entries.length) chips.push({ label: "URL 条数", value: String(entries.length) });
     if (data.keyword) chips.push({ label: "关键字", value: fmtScalar("keyword", data.keyword) });
   } else if (objectType === "policy") {
+    // 策略覆盖三段：应用控制 / 端口控制 / 代理控制，各段以 include 开关门控（关=不生效、不计），
+    // 否则只配了端口控制的策略会误显示为「规则数 0」、看不到实际内容。
+    chips.push({ label: "启用", value: data.enable === false ? "否" : "是" });
     const rules = Array.isArray(data.rules) ? data.rules : [];
-    chips.push({ label: "规则数", value: String(rules.length) });
-    const refCount = (rules as any[]).reduce(
-      (n, r) => n + (Array.isArray(r?.apps) ? r.apps.length : 0) + (Array.isArray(r?.urls) ? r.urls.length : 0),
-      0
-    );
-    if (refCount) chips.push({ label: "引用应用/URL", value: String(refCount) });
+    const netRules = Array.isArray(data.network_rules) ? data.network_rules : [];
+    if (data.application_include && rules.length)
+      chips.push({ label: "应用控制", value: `${rules.length} 条规则` });
+    if (data.network_include && netRules.length)
+      chips.push({ label: "端口控制", value: `${netRules.length} 条规则` });
+    const proxy = (data.proxy ?? {}) as Record<string, unknown>;
+    if (data.proxy_include && (proxy.http || proxy.sock || proxy.errorproto))
+      chips.push({ label: "代理控制", value: "启用" });
   }
   return chips;
 }
@@ -772,7 +783,19 @@ function SnapshotView({ data, objectType }: { data: Record<string, unknown>; obj
     if (ips.length) lists.push({ label: "IP 范围", entries: ips });
     if (doms.length) lists.push({ label: "域名", entries: doms });
   }
+  // 策略三段（与 PolicyDiff 一致，只读单边展示、中性色）：应用控制 / 端口控制 / 代理控制，
+  // 各段以 include 开关门控——否则只配端口控制的策略会看不到内容。
   const rules = objectType === "policy" ? asRules(data.rules) : [];
+  const netRules = objectType === "policy" ? asNetRules(data.network_rules) : [];
+  const proxy = (data.proxy ?? {}) as Record<string, unknown>;
+  const proxyItems =
+    objectType === "policy" && data.proxy_include
+      ? ([proxy.http && "HTTP 代理", proxy.sock && "SOCKS 代理", proxy.errorproto && "非标准协议"].filter(
+          Boolean
+        ) as string[])
+      : [];
+  const showApp = objectType === "policy" && !!data.application_include && rules.length > 0;
+  const showNet = objectType === "policy" && !!data.network_include && netRules.length > 0;
 
   return (
     <div className="space-y-1.5 text-xs">
@@ -799,14 +822,15 @@ function SnapshotView({ data, objectType }: { data: Record<string, unknown>; obj
           </span>
         </div>
       ))}
-      {rules.length > 0 && (
+      {showApp && (
         <div className="space-y-1">
+          <div className="text-[11px] font-medium text-muted-foreground/60">应用控制</div>
           {rules.map((r, i) => {
-            const apps = r.apps.map((a) => a.path);
-            const urls = r.urls.map((u) => u.name);
+            const apps = r.apps.map((a) => a.path).filter((p) => !isUrlRef(p));
+            const urls = r.apps.map((a) => a.path).filter(isUrlRef);
             return (
               <div key={i} className="rounded border border-border/40 bg-muted/10 px-2 py-1 space-y-0.5">
-                <div className="text-muted-foreground/60">规则 {i + 1}</div>
+                <div className="text-muted-foreground/60">规则 {i + 1} · {actionText(r.action)}</div>
                 {apps.length > 0 && (
                   <CategoryRow label="应用" items={apps.map((v) => ({ value: v, state: "same" as const }))} />
                 )}
@@ -816,6 +840,22 @@ function SnapshotView({ data, objectType }: { data: Record<string, unknown>; obj
               </div>
             );
           })}
+        </div>
+      )}
+      {showNet && (
+        <div className="space-y-1">
+          <div className="text-[11px] font-medium text-muted-foreground/60">端口控制</div>
+          <span className="flex flex-wrap gap-x-3 gap-y-0.5 text-muted-foreground/70">
+            {netRules.map((r, i) => (
+              <span key={i} className="break-all">{netRuleText(r)}</span>
+            ))}
+          </span>
+        </div>
+      )}
+      {proxyItems.length > 0 && (
+        <div className="space-y-1">
+          <div className="text-[11px] font-medium text-muted-foreground/60">代理控制</div>
+          <span className="text-muted-foreground/70">{proxyItems.join("、")}</span>
         </div>
       )}
     </div>
@@ -925,8 +965,13 @@ function BatchNameList({ label, names, cls }: { label: string; names: string[]; 
   );
 }
 
-function BatchResultCard({ t }: { t: BatchTargetResult }) {
+function BatchResultCard({ t, objectType }: { t: BatchTargetResult; objectType: ObjectType }) {
   const total = t.created.length + t.updated.length + t.deleted.length + t.failed.length;
+  // 保护性跳过（如镜像删除时策略在用不删），单独列出让用户知道哪些对象被留下及原因
+  const skipped = t.details.filter((d) => d.action === "skip");
+  // 策略镜像删除的 dry-run 只列候选名单、不做引用校验（真实执行才校验，遍历组织树较慢）；
+  // BatchTargetResult.deleted 只是名称数组，不带 details 里的候选说明，故单独提示一行。
+  const showPolicyDryRunDeleteNote = objectType === "policy" && t.dry_run && t.deleted.length > 0;
   return (
     <div className="rounded-lg border p-3 space-y-2">
       <div className="flex items-center justify-between">
@@ -935,6 +980,10 @@ function BatchResultCard({ t }: { t: BatchTargetResult }) {
           <Badge variant="destructive">读取失败</Badge>
         ) : t.failed.length > 0 ? (
           <Badge variant="warning">{t.failed.length} 项失败</Badge>
+        ) : total === 0 && skipped.length > 0 ? (
+          // 全部是保护性跳过（如镜像删除时策略在用）而没有其它变更时，不能说「无变化」——
+          // 目标其实有多余对象，只是为安全没删，容易被误读成「目标已和源一致」
+          <Badge variant="secondary">已跳过 {skipped.length} 项</Badge>
         ) : total === 0 ? (
           <Badge variant="secondary">无变化</Badge>
         ) : (
@@ -950,6 +999,11 @@ function BatchResultCard({ t }: { t: BatchTargetResult }) {
           </span>
           <span>删除 <span className="text-red-400">{t.deleted.length}</span></span>
           <span>失败 <span className="text-amber-400">{t.failed.length}</span></span>
+          {skipped.length > 0 && (
+            <span title="保护性跳过：如镜像删除时策略仍被用户引用，不删除">
+              跳过 <span className="text-sky-300">{skipped.length}</span>
+            </span>
+          )}
         </div>
       )}
       {!t.error && t.updated.length > 0 && (
@@ -957,10 +1011,25 @@ function BatchResultCard({ t }: { t: BatchTargetResult }) {
           「覆盖」= 目标已存在同名对象，将写入源内容覆盖（批量不逐项比对内容；要看内容差异请用「单个对象」模式）。
         </p>
       )}
+      {!t.error && showPolicyDryRunDeleteNote && (
+        <p className="text-[11px] text-amber-400/80">
+          「删除」为候选名单，预览不做引用校验；真实执行时若策略仍被引用会改为跳过、不会真正删除。
+        </p>
+      )}
       <div className="space-y-1">
         <BatchNameList label="新增" names={t.created} cls="text-emerald-400" />
         <BatchNameList label="覆盖" names={t.updated} cls="text-sky-400" />
         <BatchNameList label="删除" names={t.deleted} cls="text-red-400" />
+        {skipped.length > 0 && (
+          <div className="rounded-md border border-sky-500/25 bg-sky-500/[0.06] p-2 space-y-0.5">
+            {skipped.map((d) => (
+              <div key={d.name} className="text-xs">
+                <span className="text-sky-300/90">{d.name}</span>
+                <span className="text-muted-foreground"> — {d.message}</span>
+              </div>
+            ))}
+          </div>
+        )}
         {t.failed.length > 0 && (
           <div className="rounded-md border border-amber-500/25 bg-amber-500/[0.06] p-2 space-y-0.5">
             {t.failed.map((f) => (
@@ -1143,6 +1212,7 @@ function CompareResultCard({
 // ── 主页面 ────────────────────────────────────────────────────────────────────
 
 export function SyncPage() {
+  const qc = useQueryClient();
   const { data: instances = [] } = useQuery({ queryKey: ["instances"], queryFn: () => instanceApi.list() });
   const enabled = instances.filter((i) => i.enabled);
 
@@ -1239,6 +1309,8 @@ export function SyncPage() {
       if (vars.dryRun) {
         toast.success("已生成同步预览（dry-run）");
       } else {
+        // 真实写入：失效所有目标实例的相关缓存，避免切到目标页面 30 秒内仍看到旧数据
+        for (const x of r.results) invalidateTargetInstanceQueries(qc, x.instance_id);
         const failed = r.results.filter((x) => !x.success).length;
         const degraded = r.results.filter((x) => x.degraded && x.success).length;
         if (failed > 0) toast.warning(`同步完成，${failed} 个目标失败/被拒绝`);
@@ -1266,9 +1338,14 @@ export function SyncPage() {
       setResultKey(currentKey);
       setConfirmApply(null);
       const failed = r.targets.reduce((n, t) => n + t.failed.length, 0);
-      if (vars.dryRun) toast.success("已生成批量同步预览（dry-run）");
-      else if (failed === 0) toast.success("批量同步完成");
-      else toast.warning(`批量同步完成，${failed} 项失败`);
+      if (vars.dryRun) {
+        toast.success("已生成批量同步预览（dry-run）");
+      } else {
+        // 真实写入：失效所有目标实例的相关缓存，避免切到目标页面 30 秒内仍看到旧数据
+        for (const t of r.targets) invalidateTargetInstanceQueries(qc, t.instance_id);
+        if (failed === 0) toast.success("批量同步完成");
+        else toast.warning(`批量同步完成，${failed} 项失败`);
+      }
     },
     onError: (e: any) => toast.error(e?.response?.data?.detail ?? "批量同步失败"),
   });
@@ -1566,7 +1643,9 @@ export function SyncPage() {
                       <div className="text-xs text-muted-foreground">
                         源共 {batchResult.source_count} 个对象{batchResult.mirror && <span className="text-amber-300/90"> · 镜像模式（删除目标多余）</span>}
                       </div>
-                      {batchResult.targets.map((t) => <BatchResultCard key={t.instance_id} t={t} />)}
+                      {batchResult.targets.map((t) => (
+                        <BatchResultCard key={t.instance_id} t={t} objectType={batchResult.object_type} />
+                      ))}
                     </>
                   ) : (
                     <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">

@@ -31,6 +31,22 @@ def test_session_pool_wraps_decrypt_error_as_sangfor_web_error():
         session_pool._decrypt_or_raise("not-a-valid-token", field="Web 密码：")
 
 
+def test_audit_log_out_serializes_created_at_with_utc_offset():
+    """库存的无时区 UTC 时间序列化必须带时区标记，否则前端 new Date() 当本地时间解析、显示差 8 小时。"""
+    from datetime import datetime, timezone
+
+    from app.schemas.common import AuditLogOut
+
+    out = AuditLogOut(
+        id=1, created_at=datetime(2026, 7, 1, 2, 43, 0), actor="admin", instance_id=None,
+        instance_name="", object_type="policy", object_name="p", action="delete",
+        success=True, message="", before="", after="",
+    )
+    assert out.created_at.tzinfo == timezone.utc
+    dumped = out.model_dump_json()
+    assert "02:43:00Z" in dumped or "02:43:00+00:00" in dumped
+
+
 def _client() -> SangforWebClient:
     c = SangforWebClient("https", "127.0.0.1", 443, "u", "p")
     c._logged_in = True  # 跳过真实登录
@@ -1453,6 +1469,110 @@ def test_batch_sync_mirror_deletes_extra_target_objects(monkeypatch):
     assert set(t.created) == {"a"} and set(t.updated) == {"b"}
     assert set(t.deleted) == {"c", "d"}  # 源没有的被镜像删除
     assert set(target_web.deleted) == {"c", "d"}  # 真实调用了删除接口
+
+
+class _PolicyMirrorWeb:
+    """策略镜像测试替身：按名单列策略、记录删除调用与删前快照读取。"""
+
+    def __init__(self, names):
+        self._names = list(names)
+        self.deleted: list[str] = []
+        self.snapshot_reads: list[str] = []
+
+    def list_policies(self):
+        return {"access_policies": [{"name": n} for n in self._names]}
+
+    def list_custom_rules(self):
+        return []
+
+    def list_url_groups(self):
+        return {"flat": []}
+
+    def list_app_tree(self):
+        return {"data": []}
+
+    def get_policy_detail(self, name):
+        self.snapshot_reads.append(name)
+        return {"policy_name": name}
+
+    def delete_policy(self, name, *, dry_run=True):
+        self.deleted.append(name)
+        return {"dry_run": dry_run}
+
+
+def _setup_policy_mirror(monkeypatch, usage_result):
+    """源 ["a"] / 目标 ["a", "x", "y"]，镜像多余对象为 x、y；引用校验结果由入参指定。"""
+    from app.services import sync_service
+
+    source_web, target_web = _PolicyMirrorWeb(["a"]), _PolicyMirrorWeb(["a", "x", "y"])
+
+    class _Inst:
+        def __init__(self, i, n):
+            self.id, self.name = i, n
+
+    insts = {1: _Inst(1, "源"), 2: _Inst(2, "目标")}
+    webs = {1: source_web, 2: target_web}
+    monkeypatch.setattr(sync_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    monkeypatch.setattr(sync_service.session_pool, "get_web_client", lambda inst: webs[inst.id])
+    monkeypatch.setattr(sync_service, "_write_to_target", lambda *a, **k: {"dry_run": False})
+    monkeypatch.setattr(sync_service, "invalidate_instance", lambda i: None)
+    monkeypatch.setattr(sync_service.audit, "record", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sync_service.policy_usage_service, "analyze_policy_usage", lambda inst, force=False: usage_result
+    )
+    return sync_service, target_web
+
+
+def test_batch_sync_mirror_policy_skips_in_use_and_reads_snapshot(monkeypatch):
+    """策略镜像删除安全闸：在用策略（x）跳过不删；未用策略（y）删除前读删前快照。"""
+    usage = {"errors": [], "policies": [
+        {"name": "x", "user_count": 3, "used": True},
+        {"name": "y", "user_count": 0, "used": False},
+    ]}
+    sync_service, target_web = _setup_policy_mirror(monkeypatch, usage)
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="policy", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=True, dry_run=False,
+    )
+    t = res.targets[0]
+    assert target_web.deleted == ["y"] and t.deleted == ["y"]  # 在用的 x 未删
+    assert not t.failed
+    skips = [d for d in t.details if d.action == "skip"]
+    assert len(skips) == 1 and skips[0].name == "x" and "3 个用户引用" in skips[0].message
+    assert "y" in target_web.snapshot_reads  # 删除前读取了完整详情作审计快照
+
+
+def test_batch_sync_mirror_policy_blocks_when_name_missing_from_usage_result(monkeypatch):
+    """引用校验成功但结果里没有某个策略名（如与镜像名单间的时间差/固件解析差异）：
+    不当作 0 引用直接删——为安全按「无法确认」拒绝，只有确实在结果里且 user_count=0 的才删。"""
+    usage = {"errors": [], "policies": [{"name": "y", "user_count": 0, "used": False}]}  # 缺 x
+    sync_service, target_web = _setup_policy_mirror(monkeypatch, usage)
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="policy", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=True, dry_run=False,
+    )
+    t = res.targets[0]
+    assert target_web.deleted == ["y"] and t.deleted == ["y"]  # y 在结果里且未用，正常删除
+    assert {f.name for f in t.failed} == {"x"}  # x 不在结果里，按无法确认拒绝，不当 0 引用删
+    assert "无法确认" in t.failed[0].message
+
+
+def test_batch_sync_mirror_policy_blocks_when_usage_check_fails(monkeypatch):
+    """引用校验失败（部分组读不到）时无法确认在用与否，该目标的策略镜像删除全部拒绝。"""
+    sync_service, target_web = _setup_policy_mirror(
+        monkeypatch, {"errors": ["组A: 读取失败"], "policies": []}
+    )
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="policy", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=True, dry_run=False,
+    )
+    t = res.targets[0]
+    assert target_web.deleted == [] and t.deleted == []
+    assert {f.name for f in t.failed} == {"x", "y"}
+    assert all("引用校验失败" in f.message for f in t.failed)
 
 
 # --------------------------------------------------------------------------- #

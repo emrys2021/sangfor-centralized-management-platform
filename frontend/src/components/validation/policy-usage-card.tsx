@@ -217,15 +217,18 @@ export function PolicyUsageCard({ instanceId }: { instanceId: number }) {
               </div>
             )}
             <div className="overflow-hidden rounded-lg border border-white/10">
-              <div className="grid grid-cols-[40px_1fr_120px_90px_70px_50px] gap-2 border-b border-white/10 bg-white/[0.02] px-3 py-2 text-[11px] font-medium text-muted-foreground">
-                <span>序号</span>
-                <span>策略名称</span>
-                <span>创建者</span>
-                <span>引用用户</span>
-                <span>状态</span>
-                <span className="text-right">操作</span>
-              </div>
-              <div className="max-h-[460px] divide-y divide-white/5 overflow-auto">
+              {/* 表头与数据行放在同一滚动容器：否则数据区出现滚动条会占宽、把 1fr 列压窄，
+                  导致表头与数据列错位。表头 sticky 固定，bg-card 不透明以盖住滚动内容。 */}
+              <div className="max-h-[460px] overflow-auto">
+                <div className="sticky top-0 z-10 grid grid-cols-[40px_1fr_120px_90px_70px_50px] gap-2 border-b border-white/10 bg-card px-3 py-2 text-[11px] font-medium text-muted-foreground">
+                  <span>序号</span>
+                  <span>策略名称</span>
+                  <span>创建者</span>
+                  <span>引用用户</span>
+                  <span>状态</span>
+                  <span className="text-right">操作</span>
+                </div>
+                <div className="divide-y divide-white/5">
                 {policies.map((p: PolicyUsageItem) => (
                   <div
                     key={p.name}
@@ -271,6 +274,7 @@ export function PolicyUsageCard({ instanceId }: { instanceId: number }) {
                     </div>
                   </div>
                 ))}
+                </div>
               </div>
             </div>
           </>

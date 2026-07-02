@@ -176,12 +176,15 @@ export const policyApi = {
 
 // ---- 功能 5：同步 ----
 export const syncApi = {
+  // 单对象差异预览：策略要逐目标拉快照，慢设备/多目标可能超过默认 60s，与 batch/compare 一致放宽超时。
   diff: (body: {
     object_type: ObjectType;
     object_name: string;
     source_instance_id: number;
     target_instance_ids: number[];
-  }) => http.post<SyncDiffResult>("/sync/diff", body).then((r) => r.data),
+  }) => http.post<SyncDiffResult>("/sync/diff", body, { timeout: 300000 }).then((r) => r.data),
+  // 单对象同步：策略同步逐目标拉应用树、自动建引用、写入（目标间串行），可能超过默认 60s；
+  // 若前端先超时而后端仍在继续写，用户会误判失败而重试造成重复写，故放宽超时。
   apply: (body: {
     object_type: ObjectType;
     object_name: string;
@@ -190,7 +193,7 @@ export const syncApi = {
     push_all: boolean;
     dry_run: boolean;
     allow_degrade?: boolean;
-  }) => http.post<SyncApplyResult>("/sync/apply", body).then((r) => r.data),
+  }) => http.post<SyncApplyResult>("/sync/apply", body, { timeout: 300000 }).then((r) => r.data),
   // 批量同步整类对象；mirror=true 时删除目标多余对象。建索引/逐条写较慢，放宽超时。
   batch: (body: {
     object_type: ObjectType;

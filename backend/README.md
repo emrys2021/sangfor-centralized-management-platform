@@ -1,6 +1,6 @@
 # 后端 — 深信服 AC 统一管理系统
 
-FastAPI + SQLAlchemy 后端。接口层复用并改造自 `hznmops` 的 `sangfor_web.py` / `sangfor_api.py`。
+FastAPI + SQLAlchemy 后端。接口层复用并改造自已验证的深信服 Web/CGI 与官方 API 客户端实现。
 
 ## 运行
 

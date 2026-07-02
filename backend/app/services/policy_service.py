@@ -135,8 +135,15 @@ def create_policy(db: Session, user: CurrentUser, instance: Instance, form: dict
 
 def delete_policy(db: Session, user: CurrentUser, instance: Instance, policy_name: str, dry_run: bool):
     web = session_pool.get_web_client(instance)
+    # 真实删除前留完整详情快照进审计 before（尽力而为），误删后可按快照内容重建；预览不读
+    before = None
+    if not dry_run:
+        try:
+            before = web.get_policy_detail(policy_name)
+        except Exception:  # noqa: BLE001  快照读不到不阻断删除本身
+            pass
     result = web.delete_policy(policy_name, dry_run=dry_run)
-    _audit(db, user, instance, "dry_run" if dry_run else "delete", policy_name, result, message="删除策略")
+    _audit(db, user, instance, "dry_run" if dry_run else "delete", policy_name, result, before, message="删除策略")
     if not dry_run:
         # 与 create/update 及自定义应用/URL 删除一致：真实删除后失效该实例的分析/对比/搜索/引用缓存，
         # 否则桑基图、全量对比、全局搜索会残留已删策略（最多留一个 TTL）。

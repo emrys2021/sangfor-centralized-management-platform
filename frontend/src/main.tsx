@@ -15,7 +15,9 @@ const initialTheme = useAppStore.getState().theme;
 document.documentElement.classList.toggle("dark", initialTheme === "dark");
 
 const queryClient = new QueryClient({
-  defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },
+  // staleTime 30s：切换页面再回来时 30 秒内直接用缓存、不重复拉设备；
+  // 写操作已通过 invalidateQueries 主动刷新对应列表，不受此影响。
+  defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false, staleTime: 30_000 } },
 });
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

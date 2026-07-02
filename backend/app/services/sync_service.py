@@ -45,7 +45,7 @@ from app.schemas.sync import (
     TargetApplyResult,
     TargetDiff,
 )
-from app.services import customrule_form, instance_service, policy_sync
+from app.services import customrule_form, instance_service, policy_sync, policy_usage_service
 from app.services.analysis_cache import invalidate_instance
 
 # 设备「对象不存在」类报错的判别关键词：命中则视为 not_found（可新增），否则一律按
@@ -463,6 +463,21 @@ def _delete_from_target(web: SangforWebClient, object_type: str, name: str, dry_
     return web.delete_policy(name, dry_run=dry_run)
 
 
+def _read_before_delete(web: SangforWebClient, object_type: str, name: str) -> dict | None:
+    """删前快照（尽力而为）：读取完整对象详情存入审计 ``before``，误删后可按快照重建。
+
+    读取失败返回 ``None``、不阻断删除本身（与单对象删除路径的取舍一致）。
+    """
+    try:
+        if object_type == "customrule":
+            return web.get_custom_rule_detail(name)
+        if object_type == "url":
+            return web.get_url_group_detail(name)
+        return web.get_policy_detail(name)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def batch_sync(
     db: Session,
     user: CurrentUser,
@@ -480,6 +495,17 @@ def batch_sync(
     复用单对象写路径（``_write_to_target``），自定义应用/URL 直写、策略带 crc 重映射与自动
     建引用。性能：源对象列表与（策略用的）源自定义名单各预读一次；每个目标的应用树索引建一次、
     复用给该目标的每条策略。
+
+    镜像删除的安全措施（仅真实执行时生效；dry-run 预览**不做引用校验**、只按名称列候选名单，
+    遍历组织树的校验较慢、放进预览会拖慢秒回体验——真实执行时才校验，故候选名单与实际删除结果
+    可能不同：预览里的策略若在此期间被引用，真实执行时会被跳过而非删除，前端文案已标注这一点）：
+
+    - **策略**：删除前对目标做一次强制刷新的引用校验，在用（有用户引用）的策略跳过不删；
+      校验失败（部分组读不到等）时无法确认在用与否，该目标的策略镜像删除全部拒绝；校验成功
+      但结果里**没有**某个策略名（与镜像名单来自两次独立设备调用、之间可能有时间差或固件解析
+      差异）同样视为「无法确认」，不当作 0 引用直接删。
+    - 每个被删对象删除前读取完整详情作为快照，随删除动作单独落一条审计（``before`` 字段），
+      误删后可按快照内容重建。
     """
     source_inst = instance_service.get_instance(db, source_instance_id)
     if not source_inst:
@@ -586,19 +612,75 @@ def batch_sync(
 
         # 2) 镜像删除：目标上源没有的对象
         if mirror:
-            for name in sorted(target_name_set - source_name_set):
-                if dry_run:  # 预览只列名单，不发删除请求
+            extra_names = sorted(target_name_set - source_name_set)
+            # 策略镜像删除的安全闸（与「一键清理无人引用」同一取舍）：真实删除前对目标做一次
+            # **强制刷新**的引用校验——在用策略跳过不删；校验有组读取失败/异常时数据不完整，
+            # 为安全全部拒删（否则可能把仅仅是"没读到引用"的在用策略当成多余对象删掉）。
+            usage_by_name: dict[str, int] = {}
+            usage_error = ""
+            if extra_names and object_type == "policy" and not dry_run:
+                try:
+                    usage = policy_usage_service.analyze_policy_usage(target_inst, force=True)
+                    errs = usage.get("errors") or []
+                    if errs:
+                        usage_error = "；".join(str(e) for e in errs)
+                    else:
+                        usage_by_name = {
+                            p["name"]: int(p.get("user_count", 0) or 0) for p in usage.get("policies", [])
+                        }
+                except Exception as exc:  # noqa: BLE001
+                    usage_error = str(exc)
+            for name in extra_names:
+                if dry_run:  # 预览只列候选名单，不做引用校验、不发删除请求（校验遍历组织树较慢）；
+                    # 真实执行时会重新校验引用，在用的策略届时会被跳过——预览与实际执行结果可能不同。
                     deleted.append(name)
+                    msg = "候选镜像删除（源中不存在；真实执行前会重新校验引用，在用的策略将跳过）"
                     details.append(
-                        BatchObjectResult(name=name, action="delete", ok=True, message="镜像删除（源中不存在）")
+                        BatchObjectResult(name=name, action="delete", ok=True, message=msg)
+                        if object_type == "policy"
+                        else BatchObjectResult(name=name, action="delete", ok=True, message="镜像删除（源中不存在）")
                     )
                     continue
+                if object_type == "policy" and usage_error:
+                    failed.append(BatchObjectResult(
+                        name=name, action="fail", ok=False,
+                        message=f"为安全未删除：目标策略引用校验失败，无法确认是否在用（{usage_error}）",
+                    ))
+                    continue
+                if object_type == "policy" and name not in usage_by_name:
+                    # 校验本身成功，但结果里没有这个策略名（列表与镜像名单来自两次独立设备调用间的
+                    # 时间差、固件解析差异等）——同样无法确认是否在用，为安全不删，而非当作 0 引用。
+                    failed.append(BatchObjectResult(
+                        name=name, action="fail", ok=False,
+                        message="为安全未删除：引用校验结果未包含该策略，无法确认是否在用",
+                    ))
+                    continue
+                if usage_by_name.get(name, 0) > 0:
+                    details.append(BatchObjectResult(
+                        name=name, action="skip", ok=True,
+                        message=f"在用（{usage_by_name[name]} 个用户引用），已跳过镜像删除",
+                    ))
+                    continue
                 try:
+                    before = _read_before_delete(web, object_type, name)
                     _delete_from_target(web, object_type, name, dry_run)
                     invalidate_instance(tid)
                     deleted.append(name)
                     details.append(
                         BatchObjectResult(name=name, action="delete", ok=True, message="镜像删除（源中不存在）")
+                    )
+                    # 每个被删对象单独落一条审计并带删前快照，误删后可按快照内容重建
+                    audit.record(
+                        db,
+                        actor=user.username,
+                        object_type=object_type,
+                        action="delete",
+                        object_name=name,
+                        instance_id=tid,
+                        instance_name=target_inst.name,
+                        message=f"镜像删除（{source_inst.name} 中不存在）",
+                        before=before,
+                        after=None,
                     )
                 except Exception as exc:  # noqa: BLE001
                     failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=f"删除失败：{exc}"))

@@ -7,9 +7,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.common import UtcDatetime
 
 
 class InstanceBase(BaseModel):
@@ -48,8 +48,8 @@ class InstanceOut(InstanceBase):
     id: int
     has_web_password: bool = False
     has_api_key: bool = False
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
 
 
 class ConnectionTestResult(BaseModel):
