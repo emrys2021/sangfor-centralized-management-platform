@@ -248,6 +248,74 @@ function ruleEq(s: PolicyRule, t: PolicyRule): boolean {
   return s.action === t.action && sameKeys(s.apps.map((a) => a.path), t.apps.map((a) => a.path));
 }
 
+// 两条规则的引用集合相似度（Jaccard：共同引用数 / 并集），用于把「其实是同一条规则的改动版」
+// 正确配对，而非按顺序硬配。都无引用时按动作定；动作相同加极小权重，仅用于相近时打破平局。
+function ruleSim(a: PolicyRule, b: PolicyRule): number {
+  const sa = new Set(a.apps.map((x) => x.path));
+  const sb = new Set(b.apps.map((x) => x.path));
+  if (sa.size === 0 && sb.size === 0) return a.action === b.action ? 1 : 0.5;
+  let inter = 0;
+  for (const p of sa) if (sb.has(p)) inter++;
+  const union = sa.size + sb.size - inter;
+  const jaccard = union === 0 ? 0 : inter / union;
+  return jaccard + (a.action === b.action ? 0.001 : 0);
+}
+
+// 对齐后的一行：一致/变更两侧都有(s+tg)、纯新增只有 s、目标多出只有 tg；带原始位置(1-based)。
+type RuleAlign = { s?: PolicyRule; tg?: PolicyRule; sPos?: number; tPos?: number };
+
+// 用「加权序列对齐」（Needleman-Wunsch 式 DP）对齐两组规则：以引用相似度为匹配得分，在**保持两侧
+// 顺序**的前提下最大化对齐总分——完全相同=一致、相似=变更（高亮增删的引用/动作）、无共同引用=纯
+// 新增/目标多出。对齐结果**非交叉、两侧顺序单调**，可直接用于双栏（side-by-side）空行占位布局；
+// 既解决「多插一条后续全错位」，也不会把改动版规则错配到不相干的一条。效果类似 BeyondCompare。
+function alignRules(src: PolicyRule[], tgt: PolicyRule[]): RuleAlign[] {
+  const n = src.length;
+  const m = tgt.length;
+  // dp[i][j] = 源前 i 条、目标前 j 条对齐的最大总相似度；choice 记回溯方向：0=配对 / 1=源独有 / 2=目标独有
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  const choice: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = 1; i <= n; i++) choice[i][0] = 1;
+  for (let j = 1; j <= m; j++) choice[0][j] = 2;
+  for (let i = 1; i <= n; i++)
+    for (let j = 1; j <= m; j++) {
+      const sim = ruleSim(src[i - 1], tgt[j - 1]);
+      // 只有有共同引用（sim>0）才允许配对；否则宁可各自独有（-Infinity 禁止配对）
+      const matchScore = sim > 0 ? dp[i - 1][j - 1] + sim : -Infinity;
+      const up = dp[i - 1][j]; // 源第 i 条独有
+      const left = dp[i][j - 1]; // 目标第 j 条独有
+      if (matchScore !== -Infinity && matchScore >= up && matchScore >= left) {
+        dp[i][j] = matchScore;
+        choice[i][j] = 0;
+      } else if (up >= left) {
+        dp[i][j] = up;
+        choice[i][j] = 1;
+      } else {
+        dp[i][j] = left;
+        choice[i][j] = 2;
+      }
+    }
+  // 回溯（从 n,m 到 0,0），再反转成从上到下的顺序序列（两侧序号各自单调递增，可直接用于双栏）
+  const rev: RuleAlign[] = [];
+  let i = n;
+  let j = m;
+  while (i > 0 || j > 0) {
+    const c = i > 0 && j > 0 ? choice[i][j] : i > 0 ? 1 : 2;
+    if (c === 0) {
+      rev.push({ s: src[i - 1], tg: tgt[j - 1], sPos: i, tPos: j });
+      i--;
+      j--;
+    } else if (c === 1) {
+      rev.push({ s: src[i - 1], sPos: i });
+      i--;
+    } else {
+      rev.push({ tg: tgt[j - 1], tPos: j });
+      j--;
+    }
+  }
+  rev.reverse();
+  return rev;
+}
+
 // 统计策略实际差异处数：规则级（新增/变更/目标多出，含动作差异）+ 段/策略级标量（启用、各段开关、
 // 端口规则、代理配置）。用于「差异 N 处」徽标。
 function countPolicyDiffs(src: Record<string, unknown>, diffs: FieldDiff[], targetMissing: boolean): number {
@@ -255,13 +323,9 @@ function countPolicyDiffs(src: Record<string, unknown>, diffs: FieldDiff[], targ
   const srcRules = asRules(src.rules);
   const tgtRules = asRules(targetVal(diffs, "rules", src.rules));
   let n = 0;
-  const max = Math.max(srcRules.length, tgtRules.length);
-  for (let i = 0; i < max; i++) {
-    const s = srcRules[i];
-    const tg = tgtRules[i];
-    if (!s && tg) n++;
-    else if (s && !tg) n++;
-    else if (s && tg && !ruleEq(s, tg)) n++;
+  // 与展示层一致：LCS 对齐后，一致的行不计，新增/目标多出/变更各计一处
+  for (const row of alignRules(srcRules, tgtRules)) {
+    if (!row.s || !row.tg || !ruleEq(row.s, row.tg)) n++;
   }
   for (const f of ["enable", "application_include", "network_include", "network_rules", "proxy_include", "proxy"]) {
     if (diffs.some((d) => d.field === f)) n++;
@@ -330,10 +394,164 @@ function ScalarLine({ label, s, t, changed }: { label: string; s: string; t?: st
   );
 }
 
+// 连续「一致」规则超过此条数则折叠（少则直接显示），避免长策略里一屏全是没差异的规则。
+const SAME_COLLAPSE_THRESHOLD = 6;
+
+// 段标题（应用控制 / 端口控制 / 代理控制）：左侧强调色细竖条 + 半粗，强化段落感。
+function SectionTitle({ children }: { children: string }) {
+  return (
+    <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground/75">
+      <span className="h-3 w-0.5 rounded-full bg-primary/70" />
+      {children}
+    </div>
+  );
+}
+
+// 双栏对齐中的一侧规则：高亮「本侧独有」的引用/动作（源侧绿、目标侧红删除线），共有灰显；
+// rule 为空时渲染占位（对侧独有行，本侧留白）。other 为对侧规则，用于判断哪些引用是本侧独有。
+function RuleSide({
+  rule,
+  other,
+  side,
+  posLabel,
+  badge,
+}: {
+  rule?: PolicyRule;
+  other?: PolicyRule;
+  side: "src" | "tgt";
+  posLabel: string;
+  badge?: JSX.Element;
+}) {
+  const ownCls = side === "src" ? "text-emerald-400" : "text-red-400 line-through decoration-red-400/50";
+  const dimCls = "text-muted-foreground/60";
+  if (!rule) {
+    return <div className="px-2.5 py-1.5 text-[11px] italic text-muted-foreground/35">—（无对应规则）</div>;
+  }
+  const otherSet = new Set((other?.apps ?? []).map((a) => a.path));
+  const actionDiff = !other || other.action !== rule.action;
+  const cats: { label: string; items: string[] }[] = [
+    { label: "自定义应用", items: rule.apps.filter((a) => a.custom && !isUrlRef(a.path)).map((a) => a.path) },
+    { label: "内置应用", items: rule.apps.filter((a) => !a.custom && !isUrlRef(a.path)).map((a) => a.path) },
+    { label: "URL库", items: rule.apps.filter((a) => isUrlRef(a.path)).map((a) => a.path) },
+  ];
+  const empty = cats.every((c) => c.items.length === 0);
+  return (
+    <div className="space-y-1 px-2.5 py-1.5 text-xs">
+      <div className="flex items-center gap-2">
+        <span className="font-medium text-muted-foreground/70">{posLabel}</span>
+        <span className={actionDiff ? ownCls : dimCls}>{actionText(rule.action)}</span>
+        {badge}
+      </div>
+      {empty ? (
+        <p className="text-muted-foreground/40">（无应用 / URL 引用）</p>
+      ) : (
+        cats.map(
+          (c) =>
+            c.items.length > 0 && (
+              <div key={c.label} className="grid grid-cols-[62px_1fr] gap-1.5">
+                <span className="whitespace-nowrap text-muted-foreground/50">
+                  {c.label}
+                  <span className="text-muted-foreground/30">（{c.items.length}）</span>
+                </span>
+                <span className="flex flex-wrap gap-x-2 gap-y-0.5">
+                  {c.items.map((p, i) => (
+                    <span key={i} className={`break-all ${otherSet.has(p) ? dimCls : ownCls}`}>
+                      {p}
+                    </span>
+                  ))}
+                </span>
+              </div>
+            )
+        )
+      )}
+    </div>
+  );
+}
+
+// 双栏对齐的一行：整行一个卡片（左侧状态色条 + 差异行极淡底色，行与行界限清晰）；
+// 内部左源右目标，中缝一条竖线分隔；一侧独有的对面留白占位；徽标标一致/变更/新增/目标多出。
+function RuleAlignRow({ row }: { row: RuleAlign }) {
+  const { s, tg, sPos, tPos } = row;
+  const changed = !!s && !!tg && !ruleEq(s, tg);
+  const kind = !s ? "extra" : !tg ? "new" : changed ? "changed" : "same";
+  // 差异行底色（一致行不加底色，弱化）；曾用左侧色条做二次强调，但 2px 细线下
+  // 红/绿在深色背景中观感明显弱于 amber，粗细不均反而显乱，改为只靠底色区分。
+  // 新增行不用绿色：绿色（emerald-400）在行内专指「本侧独有引用」这一更细粒度的差异，
+  // 整行级别的「新增」与「变更」共用 amber，靠徽标文字区分，避免颜色语义打架。
+  const tint = {
+    extra: "bg-red-500/10",
+    new: "bg-amber-500/10",
+    changed: "bg-amber-500/10",
+    same: "",
+  }[kind];
+  const badge =
+    kind === "extra" ? (
+      <Badge variant="destructive" className="h-4 px-1 text-[10px]">目标多出</Badge>
+    ) : kind === "new" ? (
+      <Badge variant="warning" className="h-4 px-1 text-[10px]">新增</Badge>
+    ) : kind === "changed" ? (
+      <Badge variant="warning" className="h-4 px-1 text-[10px]">变更</Badge>
+    ) : (
+      <span className="text-[10px] text-muted-foreground/40">一致</span>
+    );
+  // 整行 grid 两列，差异行底色；中缝一条竖线（行紧贴→贯通到底）；
+  // 徽标跟随「有内容的主侧」（目标多出→目标侧，其余→源侧），不横跨、不打断中缝。
+  return (
+    <div className={`grid grid-cols-2 ${tint}`}>
+      <div className="border-r border-border/60">
+        <RuleSide
+          rule={s}
+          other={tg}
+          side="src"
+          posLabel={s ? `源规则 ${sPos}` : ""}
+          badge={kind !== "extra" ? badge : undefined}
+        />
+      </div>
+      <RuleSide
+        rule={tg}
+        other={s}
+        side="tgt"
+        posLabel={tg ? `目标规则 ${tPos}` : ""}
+        badge={kind === "extra" ? badge : undefined}
+      />
+    </div>
+  );
+}
+
+// 一组连续的「一致」规则：超过阈值折叠成一条可展开的提示，少则直接逐行显示。
+function SameGroup({ rows }: { rows: RuleAlign[] }) {
+  const [open, setOpen] = useState(false);
+  if (rows.length <= SAME_COLLAPSE_THRESHOLD) {
+    return (
+      <div className="divide-y divide-border/90">
+        {rows.map((r, i) => (
+          <RuleAlignRow key={i} row={r} />
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div className="divide-y divide-border/90">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 bg-muted/10 px-2.5 py-1 text-[11px] text-muted-foreground/55 transition-colors hover:bg-muted/20"
+      >
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        {open ? "收起" : "展开"} {rows.length} 条一致规则
+      </button>
+      {open &&
+        rows.map((r, i) => (
+          <RuleAlignRow key={i} row={r} />
+        ))}
+    </div>
+  );
+}
+
 /**
  * 策略差异：**只覆盖 应用控制 / 端口控制 / 代理控制 三段 + 启用状态**（其余段——Web 关键字/
- * 文件类型过滤、邮件、QQ、SaaS 等——不参与对比、不在此显示）。应用/端口规则按位置对位、
- * 忽略跨实例 rule_id；段开关为关时不比该段规则。
+ * 文件类型过滤、邮件、QQ、SaaS 等——不参与对比、不在此显示）。应用控制规则用双栏 side-by-side
+ * 展示（内容对齐、一致行可折叠）；忽略跨实例 rule_id；段开关为关时不比该段规则。
  */
 function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown>; diffs: FieldDiff[]; targetMissing: boolean }) {
   const srcRules = asRules(src.rules);
@@ -380,8 +598,8 @@ function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown
     .filter((l) => l.changed);
 
   const showAppRules = srcAppInc || tgtAppInc;
-  const max = Math.max(srcRules.length, tgtRules.length);
-  const rows = Array.from({ length: max }, (_, i) => ({ s: srcRules[i], tg: tgtRules[i], pos: i + 1 }));
+  // 加权序列对齐（见 alignRules）：非交叉、两侧顺序单调，供下面的双栏 side-by-side 使用
+  const rows = alignRules(srcRules, tgtRules);
 
   return (
     <div className="space-y-2">
@@ -394,88 +612,39 @@ function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown
         </div>
       )}
 
-      {/* 应用控制：规则逐条对位（含动作） */}
+      {/* 应用控制：双栏 side-by-side（左源右目标，内容对齐、连续一致行可折叠） */}
       {showAppRules && (
-        <div className="space-y-1">
-          <div className="text-[11px] font-medium text-muted-foreground/60">应用控制</div>
-          <div className="space-y-1.5">
-            {rows.map(({ s, tg, pos }) => {
-        const isExtra = !s && !!tg; // 目标多出（将删除）
-        const isNew = !!s && (targetMissing || !tg);
-        const effTg = targetMissing ? undefined : tg; // 目标整体不存在时不参与比对（全部按新增）
-        const changed = !!s && !!effTg && !ruleEq(s, effTg);
-        const highlight = isNew || isExtra || changed;
-
-        const srcApps = s?.apps ?? [];
-        const tgtApps = effTg?.apps ?? [];
-        const pick = <T,>(arr: T[], f: (x: T) => boolean) => arr.filter(f);
-        const customApps = diffCategory(
-          pick(srcApps, (a) => a.custom && !isUrlRef(a.path)).map((a) => a.path),
-          pick(tgtApps, (a) => a.custom && !isUrlRef(a.path)).map((a) => a.path)
-        );
-        const builtinApps = diffCategory(
-          pick(srcApps, (a) => !a.custom && !isUrlRef(a.path)).map((a) => a.path),
-          pick(tgtApps, (a) => !a.custom && !isUrlRef(a.path)).map((a) => a.path)
-        );
-        const urlRefs = diffCategory(
-          pick(srcApps, (a) => isUrlRef(a.path)).map((a) => a.path),
-          pick(tgtApps, (a) => isUrlRef(a.path)).map((a) => a.path)
-        );
-        const empty = customApps.length + builtinApps.length + urlRefs.length === 0;
-        // 动作也用引用条目同一套 diff 着色：源动作=绿(将加到目标)、目标旧动作=红删除线(将删)、一致=灰
-        const actionItems = diffCategory(
-          s ? [actionText(s.action)] : [],
-          effTg ? [actionText(effTg.action)] : []
-        );
-
-        const border = isExtra
-          ? "border-red-500/20 bg-red-500/[0.06]"
-          : highlight
-          ? "border-amber-500/20 bg-amber-500/[0.06]"
-          : "border-border/40 bg-muted/10";
-        const ridTitle = s && tg ? `源规则 ID：${s.name}\n目标规则 ID：${tg.name}` : `规则 ID：${(s ?? tg)!.name}`;
-
-        return (
-          <div key={pos} className={`rounded px-3 py-1.5 border text-xs space-y-1 ${border}`}>
-            <div className="flex items-center gap-2">
-              <span
-                className={
-                  isExtra
-                    ? "text-red-400 line-through decoration-red-400/50"
-                    : highlight
-                    ? "font-medium text-amber-300/80"
-                    : "text-muted-foreground/70"
+        <div className="space-y-1.5">
+          <SectionTitle>应用控制</SectionTitle>
+          <div className="overflow-hidden rounded-md border border-border/50">
+            {/* 列头：与下方中缝对齐（源栏 border-r 贯通） */}
+            <div className="grid grid-cols-2 border-b border-border/50 bg-muted/20 text-[11px] font-semibold text-muted-foreground/65">
+              <span className="border-r border-border/60 px-2.5 py-1">源</span>
+              <span className="px-2.5 py-1">目标</span>
+            </div>
+            {/* 行流：紧贴排列，divide-y 分隔行、border-r 中缝一条贯通到底。
+                连续同类差异行（背景同色）会把浅色分割线"吃掉"，故用较高不透明度，
+                主题 --border 本身是暗灰色，不会显得刺眼。 */}
+            <div className="divide-y divide-border/90">
+              {(() => {
+                // 连续的「一致」行归一组（可折叠），其余逐行双栏展示，保持两侧顺序
+                const isSame = (r: RuleAlign) => !!r.s && !!r.tg && ruleEq(r.s, r.tg);
+                const groups: { same: boolean; rows: RuleAlign[] }[] = [];
+                for (const r of rows) {
+                  const same = isSame(r);
+                  const last = groups[groups.length - 1];
+                  if (last && last.same === same) last.rows.push(r);
+                  else groups.push({ same, rows: [r] });
                 }
-                title={ridTitle}
-              >
-                规则 {pos}
-              </span>
-              {isExtra ? (
-                <Badge variant="destructive" className="h-4 px-1 text-[10px]">目标多出</Badge>
-              ) : isNew ? (
-                <Badge variant="warning" className="h-4 px-1 text-[10px]">新增</Badge>
-              ) : changed ? (
-                <Badge variant="warning" className="h-4 px-1 text-[10px]">变更</Badge>
-              ) : (
-                <span className="text-[10px] text-muted-foreground/40">一致</span>
-              )}
+                return groups.map((g, gi) =>
+                  g.same ? (
+                    <SameGroup key={gi} rows={g.rows} />
+                  ) : (
+                    g.rows.map((r, i) => <RuleAlignRow key={`${gi}-${i}`} row={r} />)
+                  )
+                );
+              })()}
             </div>
-            <div className="space-y-0.5">
-              {/* 动作下沉为一行，与引用条目用同一套 diff 着色（源绿/目标红删除线/一致灰） */}
-              <CategoryRow label="动作" items={actionItems} showCount={false} />
-              {empty ? (
-                <p className="text-muted-foreground/40 text-xs">（无应用 / URL 引用）</p>
-              ) : (
-                <>
-                  <CategoryRow label="自定义应用" items={customApps} />
-                  <CategoryRow label="内置应用" items={builtinApps} />
-                  <CategoryRow label="URL库" items={urlRefs} />
-                </>
-              )}
-            </div>
-          </div>
-        );
-            })}
           </div>
         </div>
       )}
@@ -483,7 +652,7 @@ function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown
       {/* 端口控制：规则行级增删（源/目标文本化） */}
       {showNet && netItems.length > 0 && (
         <div className="space-y-1">
-          <div className="text-[11px] font-medium text-muted-foreground/60">端口控制</div>
+          <SectionTitle>端口控制</SectionTitle>
           <span className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs">
             {netItems.map((it, i) => (
               <span key={i} className={`break-all ${REF_STATE_CLS[it.state]}`}>
@@ -497,7 +666,7 @@ function PolicyDiff({ src, diffs, targetMissing }: { src: Record<string, unknown
       {/* 代理控制：http/sock/errorproto 开关差异 */}
       {showProxy && proxyLines.length > 0 && (
         <div className="space-y-1">
-          <div className="text-[11px] font-medium text-muted-foreground/60">代理控制</div>
+          <SectionTitle>代理控制</SectionTitle>
           <div className="space-y-0.5">
             {proxyLines.map((l) => (
               <ScalarLine key={l.label} {...l} />
@@ -1716,6 +1885,7 @@ export function SyncPage() {
                       <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-xs text-amber-300/90">
                         访问权限策略会按目标设备的 crc 重建报文写入：目标缺少的「自定义」应用 / URL 库会自动先建到目标；
                         但若目标有<span className="font-medium">无法解析的引用</span>（内置对象缺失、或自定义引用创建失败），丢掉它会写出与源<span className="font-medium">不等价（降级）</span>的策略（如拒绝规则少挡了对象=安全缺口）。此时<span className="font-medium">默认拒绝写入策略</span>（已建的自定义对象会保留在目标）。建议先「仅预览」核对。
+                        另外：若源和目标<span className="font-medium">已存在同名</span>的自定义应用 / URL 库但<span className="font-medium">内容不同</span>，不会被识别为差异——策略同步只按名字重映射引用，不会比对或覆盖这些对象本身的内容。
                       </div>
                       <label className="flex items-start gap-2 rounded-md border border-rose-500/25 bg-rose-500/[0.05] px-3 py-2 text-xs text-rose-300/90">
                         <input
