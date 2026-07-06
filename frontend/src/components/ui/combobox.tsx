@@ -21,8 +21,40 @@ interface ComboboxProps {
 }
 
 /**
+ * 搜索框键盘导航：↑/↓ 移动高亮项、Enter 选中（仅 1 个匹配时可直接 Enter）。
+ * Esc 关闭由 Radix Popover 自带。query 变化时高亮复位，高亮项滚动保持可见。
+ */
+function useListKeyboardNav(count: number, pick: (index: number) => void, query: string) {
+  const [active, setActive] = React.useState(-1);
+  const listRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => setActive(-1), [query]);
+  React.useEffect(() => {
+    if (active >= 0)
+      listRef.current?.querySelector(`[data-idx="${active}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [active]);
+
+  function onKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((a) => (count === 0 ? -1 : (a + 1) % count));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((a) => (count === 0 ? -1 : (a - 1 + count) % count));
+    } else if (e.key === "Enter") {
+      const target = active >= 0 && active < count ? active : count === 1 ? 0 : -1;
+      if (target >= 0) {
+        e.preventDefault();
+        pick(target);
+      }
+    }
+  }
+  return { active, setActive, listRef, onKeyDown };
+}
+
+/**
  * 带搜索的下拉选择框（基于 Popover，无额外依赖）。
- * 条目较多时输入关键字即时过滤，支持键盘上下 / 回车选择。
+ * 条目较多时输入关键字即时过滤，支持键盘 ↑/↓ 高亮、Enter 选中、Esc 关闭。
  */
 export function Combobox({
   options,
@@ -60,6 +92,8 @@ export function Combobox({
     setOpen(false);
   }
 
+  const nav = useListKeyboardNav(filtered.length, (i) => select(filtered[i].value), query);
+
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
@@ -86,22 +120,26 @@ export function Combobox({
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={nav.onKeyDown}
             placeholder={searchPlaceholder}
             className="h-9 w-full bg-transparent px-2 text-sm outline-none placeholder:text-muted-foreground"
           />
         </div>
-        <div className="max-h-64 overflow-y-auto p-1">
+        <div ref={nav.listRef} className="max-h-64 overflow-y-auto p-1">
           {filtered.length === 0 ? (
             <div className="py-6 text-center text-sm text-muted-foreground">{emptyText}</div>
           ) : (
-            filtered.map((o) => (
+            filtered.map((o, i) => (
               <button
                 key={o.value}
                 type="button"
+                data-idx={i}
                 onClick={() => select(o.value)}
+                onMouseMove={() => nav.setActive(i)}
                 className={cn(
                   "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent",
-                  o.value === value && "bg-accent/50"
+                  o.value === value && "bg-accent/50",
+                  nav.active === i && "bg-accent"
                 )}
               >
                 <Check className={cn("h-3.5 w-3.5 shrink-0", o.value === value ? "opacity-100" : "opacity-0")} />
@@ -129,7 +167,7 @@ interface MultiComboboxProps {
 /**
  * 带搜索的多选下拉框：点选不关闭面板，收起态显示「已选 N 个」（选 1 个时显示其名称）。
  * 勾选/取消逻辑（如某选项与其余互斥）由调用方在 onChange 里处理，本组件只管「切换是否在
- * value 数组里」。
+ * value 数组里」。键盘 ↑/↓ 高亮、Enter 切换勾选（不关面板）、Esc 关闭。
  */
 export function MultiCombobox({
   options,
@@ -165,6 +203,8 @@ export function MultiCombobox({
     onChange(selectedSet.has(v) ? value.filter((x) => x !== v) : [...value, v]);
   }
 
+  const nav = useListKeyboardNav(filtered.length, (i) => toggle(filtered[i].value), query);
+
   const triggerLabel =
     value.length === 0
       ? placeholder
@@ -196,6 +236,7 @@ export function MultiCombobox({
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={nav.onKeyDown}
             placeholder={searchPlaceholder}
             className="h-9 w-full bg-transparent px-2 text-sm outline-none placeholder:text-muted-foreground"
           />
@@ -209,20 +250,23 @@ export function MultiCombobox({
             </button>
           )}
         </div>
-        <div className="max-h-64 overflow-y-auto p-1">
+        <div ref={nav.listRef} className="max-h-64 overflow-y-auto p-1">
           {filtered.length === 0 ? (
             <div className="py-6 text-center text-sm text-muted-foreground">{emptyText}</div>
           ) : (
-            filtered.map((o) => {
+            filtered.map((o, i) => {
               const checked = selectedSet.has(o.value);
               return (
                 <button
                   key={o.value}
                   type="button"
+                  data-idx={i}
                   onClick={() => toggle(o.value)}
+                  onMouseMove={() => nav.setActive(i)}
                   className={cn(
                     "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent",
-                    checked && "bg-accent/50"
+                    checked && "bg-accent/50",
+                    nav.active === i && "bg-accent"
                   )}
                 >
                   <span

@@ -41,7 +41,10 @@ class SangforApiClient:
         return f"http://{self.host}:{self.port}/{self.version}"
 
     def _send(self, path: str, params: dict | None = None, method: str = "GET", retry: int = 3) -> dict:
-        time.sleep((4 / (retry + 1)) ** 2)
+        # 仅在重试（设备报「系统繁忙」）时指数退避（约 1.8s → 4s → 16s）；首次请求不等待。
+        # 旧脚本在每次请求前固定 sleep 1s 作粗暴限速，搬进 Web 后端会白白阻塞工作线程。
+        if retry < 3:
+            time.sleep((4 / (retry + 1)) ** 2)
         params = dict(params or {})
         params.update(self._ticket())
         url = f"{self._service()}{path}"

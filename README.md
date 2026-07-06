@@ -40,6 +40,9 @@ frontend/  React 前端
   src/pages/                各功能页（含 validation 数据校验页，仅状态编排+JSX）
   src/lib/validation/       constants（配色/类型）+ model（桑基/力导向 option 纯构建器）
   src/components/validation/ legend-chip / check-list / stat
+  src/components/sync/      同步页子模块：policy-rules（规则对齐纯逻辑）、policy-diff（双栏
+                            规则 diff）、field-diff / object-diff（字段级 diff）、snapshot
+                            （只读快照）、result-cards（同步/批量/对比结果卡片）
   src/components/           data-table、policy-editor、app-picker、ref-chip、ui/* 等
   src/lib/                  api、types、chart-export、policy-refs、customrule 等
 ```

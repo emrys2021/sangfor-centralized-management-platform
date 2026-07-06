@@ -295,7 +295,10 @@ def compare(
             result = _compare_names(src_names, tgt_names, names_filter=set(src_names) if object_names else None)
             for n in stale:
                 result.items.append(
-                    CompareItem(name=n, status="error", error="已选对象在源实例上已不存在（可能刚被删除，请刷新对象列表）")
+                    CompareItem(
+                        name=n, status="error",
+                        error="已选对象在源实例上已不存在（可能刚被删除，请刷新对象列表）",
+                    )
                 )
                 result.error_count += 1
             result.instance_id = tid

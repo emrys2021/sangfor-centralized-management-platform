@@ -3,6 +3,7 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 
 import { CenteredSpinner } from "@/components/common";
 import { AppLayout } from "@/components/layout";
+import { RouteErrorPage } from "@/components/route-error";
 import { AuditPage } from "@/pages/audit";
 import { CustomRulesPage } from "@/pages/customrules";
 import { InstancesPage } from "@/pages/instances";
@@ -20,6 +21,8 @@ export const router = createBrowserRouter([
   {
     path: "/",
     element: <AppLayout />,
+    // 任何子页面渲染抛错时兜底（不加则整个应用白屏）
+    errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <Navigate to="/customrules" replace /> },
       { path: "customrules", element: <CustomRulesPage /> },

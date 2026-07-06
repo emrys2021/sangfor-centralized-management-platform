@@ -582,7 +582,10 @@ def batch_sync(
         updated: list[str] = []
         deleted: list[str] = []
         failed: list[BatchObjectResult] = [
-            BatchObjectResult(name=n, action="fail", ok=False, message="已选对象在源实例上已不存在（可能刚被删除，请刷新对象列表后重试）")
+            BatchObjectResult(
+                name=n, action="fail", ok=False,
+                message="已选对象在源实例上已不存在（可能刚被删除，请刷新对象列表后重试）",
+            )
             for n in stale_names
         ]
         details: list[BatchObjectResult] = []
