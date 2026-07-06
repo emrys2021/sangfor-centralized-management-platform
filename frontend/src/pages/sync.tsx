@@ -7,7 +7,7 @@ import { JsonView, PageHeader, Spinner } from "@/components/common";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Combobox } from "@/components/ui/combobox";
+import { MultiCombobox } from "@/components/ui/combobox";
 import {
   Dialog,
   DialogContent,
@@ -1387,7 +1387,8 @@ export function SyncPage() {
 
   const [objectType, setObjectType] = useState<ObjectType>("customrule");
   const [sourceId, setSourceId] = useState<number | null>(null);
-  const [objectName, setObjectName] = useState<string>("");
+  // 对象范围：多选。ALL_OBJECTS 哨兵与具体对象互斥——选中哨兵即整类批量，见下方 onChange。
+  const [objectNames, setObjectNames] = useState<string[]>([]);
   const [targets, setTargets] = useState<number[]>([]);
   const [diff, setDiff] = useState<SyncDiffResult | null>(null);
   const [applyResult, setApplyResult] = useState<SyncApplyResult | null>(null);
@@ -1406,13 +1407,19 @@ export function SyncPage() {
 
   const sourceName = instances.find((i) => i.id === sourceId)?.name ?? "源";
   const isPolicy = objectType === "policy";
-  // 范围（单个/全部）是对象选择框里的子选项：选「全部对象」哨兵即整类批量
-  const isBatch = objectName === ALL_OBJECTS;
+  // 范围（单个/多选/全部）是对象选择框里的子选项：选中「全部对象」哨兵即整类批量；
+  // 选中 2 个及以上具体对象同样走「批量」渲染（汇总名单视图），只是子集范围更小。
+  const isAll = objectNames.length === 1 && objectNames[0] === ALL_OBJECTS;
+  const isBatch = isAll || objectNames.length > 1;
   const isCompare = mode === "compare";
+  // 单对象场景下的对象名（供沿用「单对象」诊断链路：字段级 diff / 单对象写）
+  const singleObjectName = !isBatch ? objectNames[0] ?? "" : "";
+  // 批量场景下要传给后端的「已选子集」；全选时不传（后端按全量处理，走原有缓存路径）
+  const selectedSubset = isBatch && !isAll ? objectNames : undefined;
 
   // 当前配置指纹；与 resultKey 不一致即说明右侧结果已过期
   const currentKey = JSON.stringify({
-    mode, objectType, sourceId, objectName, mirror, targets: [...targets].sort(),
+    mode, objectType, sourceId, objectNames: [...objectNames].sort(), mirror, targets: [...targets].sort(),
   });
   const stale = resultKey != null && resultKey !== currentKey;
 
@@ -1437,7 +1444,7 @@ export function SyncPage() {
     mutationFn: () =>
       syncApi.diff({
         object_type: objectType,
-        object_name: objectName,
+        object_name: singleObjectName,
         source_instance_id: sourceId!,
         target_instance_ids: targets,
       }),
@@ -1454,6 +1461,7 @@ export function SyncPage() {
         target_instance_ids: targets,
         names_only: namesOnly,
         force: force ?? false,
+        object_names: selectedSubset,
       }),
     onSuccess: (r) => { setCompareResult(r); setBatchResult(null); setResultKey(currentKey); },
     onError: (e: any) => toast.error(e?.response?.data?.detail ?? "对比失败"),
@@ -1463,7 +1471,7 @@ export function SyncPage() {
     mutationFn: ({ pushAll, dryRun }: { pushAll: boolean; dryRun: boolean }) =>
       syncApi.apply({
         object_type: objectType,
-        object_name: objectName,
+        object_name: singleObjectName,
         source_instance_id: sourceId!,
         target_instance_ids: targets,
         push_all: pushAll,
@@ -1500,6 +1508,7 @@ export function SyncPage() {
         mirror,
         dry_run: dryRun,
         allow_degrade: allowDegrade,
+        object_names: selectedSubset,
       }),
     onSuccess: (r, vars) => {
       setBatchResult(r);
@@ -1523,7 +1532,7 @@ export function SyncPage() {
     setTargets((t) => (t.includes(id) ? t.filter((x) => x !== id) : [...t, id]));
   }
 
-  const ready = sourceId != null && objectName !== "";
+  const ready = sourceId != null && objectNames.length > 0;
   const applying = applyMut.isPending || batchMut.isPending;
   const comparing = compareMut.isPending;
   // 当前意图 + 范围对应的结果：对比→字段差异 / 全量对比；同步→单对象写 / 批量写
@@ -1562,7 +1571,7 @@ export function SyncPage() {
 
             <div className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">对象类型</Label>
-              <Select value={objectType} onValueChange={(v) => { setObjectType(v as ObjectType); setObjectName(""); }}>
+              <Select value={objectType} onValueChange={(v) => { setObjectType(v as ObjectType); setObjectNames([]); setMirror(false); }}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {OBJECT_TYPES.map((t) => <SelectItem key={t.value} value={t.value}>{t.label}</SelectItem>)}
@@ -1578,7 +1587,7 @@ export function SyncPage() {
 
             <div className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">源实例</Label>
-              <Select value={sourceId != null ? String(sourceId) : undefined} onValueChange={(v) => { setSourceId(Number(v)); setObjectName(""); }}>
+              <Select value={sourceId != null ? String(sourceId) : undefined} onValueChange={(v) => { setSourceId(Number(v)); setObjectNames([]); setMirror(false); }}>
                 <SelectTrigger><SelectValue placeholder="选择源实例" /></SelectTrigger>
                 <SelectContent>
                   {enabled.map((i) => <SelectItem key={i.id} value={String(i.id)}>{i.name}</SelectItem>)}
@@ -1586,27 +1595,44 @@ export function SyncPage() {
               </Select>
             </div>
 
-            {/* 范围作为对象选择框的子选项：首项「全部对象」= 整类批量，其余为具体对象 */}
+            {/* 范围作为对象选择框的子选项：支持多选；「全部对象」与具体对象互斥（选中前者会清掉
+                后者，反之亦然），见 onChange。选中 2 个及以上（含「全部对象」）都走批量渲染。 */}
             <div className="space-y-1.5">
               <Label className="text-xs text-muted-foreground">
                 {isCompare ? "对比范围" : "同步范围"} {names.isFetching && <Spinner className="ml-1 inline" />}
               </Label>
-              <Combobox
+              <MultiCombobox
                 options={[
                   { value: ALL_OBJECTS, label: `全部对象（${names.data?.length ?? 0} 个）` },
                   ...(names.data ?? []).map((n) => ({ value: n, label: n })),
                 ]}
-                value={objectName}
-                onChange={setObjectName}
+                value={objectNames}
+                onChange={(next) => {
+                  const wasAll = objectNames.includes(ALL_OBJECTS);
+                  const nowAll = next.includes(ALL_OBJECTS);
+                  const final =
+                    !wasAll && nowAll
+                      ? [ALL_OBJECTS] // 刚勾选「全部对象」：清掉其余单选
+                      : wasAll && nowAll
+                      ? next.filter((v) => v !== ALL_OBJECTS) // 全选下又点具体项：退出全选
+                      : next;
+                  setObjectNames(final);
+                  // 镜像模式只对「全部对象」开放；一旦不再是全选就顺带关掉，避免残留状态导致后端拒绝
+                  if (mirror && !(final.length === 1 && final[0] === ALL_OBJECTS)) setMirror(false);
+                }}
                 disabled={sourceId == null}
-                placeholder={sourceId == null ? "请先选择源实例" : "选择「全部对象」或某个具体对象"}
+                placeholder={sourceId == null ? "请先选择源实例" : "选择一个或多个对象，或「全部对象」"}
                 searchPlaceholder="输入关键字搜索…"
                 emptyText="无匹配对象"
               />
               {isBatch && (
                 <p className="text-[11px] text-muted-foreground">
                   {isCompare ? "将对比源与目标的" : "将把源的"}
-                  <span className="text-foreground/70">全部{OBJECT_TYPES.find((t) => t.value === objectType)?.label}</span>
+                  <span className="text-foreground/70">
+                    {isAll
+                      ? `全部${OBJECT_TYPES.find((t) => t.value === objectType)?.label}`
+                      : `已选 ${objectNames.length} 个${OBJECT_TYPES.find((t) => t.value === objectType)?.label}`}
+                  </span>
                   {isCompare ? "（名单 + 内容）。" : "写入所选目标。"}
                 </p>
               )}
@@ -1631,7 +1657,7 @@ export function SyncPage() {
               </div>
             </div>
 
-            {isBatch && !isCompare && (
+            {isBatch && !isCompare && isAll && (
               <div className="flex items-center justify-between rounded-lg border border-amber-500/25 bg-amber-500/[0.05] px-3 py-2">
                 <div className="space-y-0.5">
                   <Label className="text-xs font-medium text-amber-300/90">镜像模式</Label>
@@ -1639,6 +1665,11 @@ export function SyncPage() {
                 </div>
                 <Switch checked={mirror} onCheckedChange={setMirror} />
               </div>
+            )}
+            {isBatch && !isCompare && !isAll && (
+              <p className="text-[11px] text-muted-foreground/60">
+                镜像模式（删除目标多余对象）仅支持「全部对象」，已选子集时不可用——否则会把未选中但双方都合法存在的对象误删。
+              </p>
             )}
 
             <div className="flex flex-wrap gap-2 pt-2">
@@ -1712,7 +1743,9 @@ export function SyncPage() {
             <CardTitle className="text-base">
               {isCompare
                 ? isBatch
-                  ? "全部对象对比（只读）"
+                  ? isAll
+                    ? "全部对象对比（只读）"
+                    : "已选对象对比（只读）"
                   : "单个对象对比（只读）"
                 : isBatch
                 ? batchResult
@@ -1857,8 +1890,10 @@ export function SyncPage() {
                     <span className="text-muted-foreground">{confirmApply.batch ? "范围" : "对象"}</span>
                     <span className="font-medium">
                       {confirmApply.batch
-                        ? `全部${typeLabel}${names.data ? `（${names.data.length} 个）` : ""}`
-                        : objectName}
+                        ? isAll
+                          ? `全部${typeLabel}${names.data ? `（${names.data.length} 个）` : ""}`
+                          : `已选 ${objectNames.length} 个${typeLabel}`
+                        : singleObjectName}
                     </span>
                     <span className="text-muted-foreground">源实例</span>
                     <span>{sourceName}</span>

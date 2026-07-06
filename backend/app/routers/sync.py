@@ -60,6 +60,7 @@ def batch_sync(
             mirror=req.mirror,
             dry_run=req.dry_run,
             allow_degrade=req.allow_degrade,
+            object_names=req.object_names,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -78,6 +79,7 @@ def compare(req: BatchCompareRequest, db: Session = Depends(get_db)):
             target_instance_ids=req.target_instance_ids,
             names_only=req.names_only,
             force=req.force,
+            object_names=req.object_names,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -53,23 +53,42 @@ def _init_snap_worker(base: SangforWebClient) -> None:
     _snap_tls.client = clone() if callable(clone) else base
 
 
-def _fetch_index(web: SangforWebClient, object_type: str) -> dict:
-    """并行拉取某实例该类**全部对象**的规范化快照。
+def _fetch_index(web: SangforWebClient, object_type: str, names: list[str] | None = None) -> dict:
+    """并行拉取某实例该类对象的规范化快照。
+
+    ``names`` 不给时取**全部对象**（先 list 名单再逐个拉详情）；给定时视为「已选子集」——
+    跳过全量 list，直接按这些名字并行拉详情，选得越少越快。子集场景下某个名字其实不存在于
+    该实例，``_build_snapshot`` 会返回 ``not_found``，从返回的 ``names`` 里剔除（其余逻辑
+    与全量一致，不影响下游按存在与否分类）。
 
     返回 ``{"names": [名称...], "snaps": {名称: (status, 快照, 错误)}}``。
     """
-    names = sync_service._list_object_names(web, object_type)
+    if names is None:
+        names = sync_service._list_object_names(web, object_type)
+        if not names:
+            return {"names": [], "snaps": {}}
+        web.login()  # 并发前先登录，避免多线程同时登录
+
+        def one(name: str):
+            return name, sync_service._build_snapshot(_snap_tls.client, object_type, name)
+
+        workers = min(settings.fetch_concurrency, max(1, len(names)))
+        with ThreadPoolExecutor(max_workers=workers, initializer=_init_snap_worker, initargs=(web,)) as pool:
+            snaps = dict(pool.map(one, names))
+        return {"names": names, "snaps": snaps}
+
     if not names:
         return {"names": [], "snaps": {}}
-    web.login()  # 并发前先登录，避免多线程同时登录
+    web.login()
 
-    def one(name: str):
+    def one_subset(name: str):
         return name, sync_service._build_snapshot(_snap_tls.client, object_type, name)
 
     workers = min(settings.fetch_concurrency, max(1, len(names)))
     with ThreadPoolExecutor(max_workers=workers, initializer=_init_snap_worker, initargs=(web,)) as pool:
-        snaps = dict(pool.map(one, names))
-    return {"names": names, "snaps": snaps}
+        snaps = dict(pool.map(one_subset, names))
+    resolved_names = [n for n in names if snaps[n][0] != "not_found"]
+    return {"names": resolved_names, "snaps": snaps}
 
 
 def _index(instance: Instance, object_type: str, *, force: bool = False) -> tuple[dict, bool, int]:
@@ -134,12 +153,19 @@ def _list_names(instance: Instance, object_type: str) -> list[str]:
     return sync_service._list_object_names(session_pool.get_web_client(instance), object_type)
 
 
-def _compare_names(src_names: list[str], tgt_names: list[str]) -> CompareTargetResult:
-    """仅名单对比：只按对象名分「仅源有 / 仅目标有 / 两边都有」，不比内容。"""
+def _compare_names(
+    src_names: list[str], tgt_names: list[str], names_filter: set[str] | None = None
+) -> CompareTargetResult:
+    """仅名单对比：只按对象名分「仅源有 / 仅目标有 / 两边都有」，不比内容。
+
+    ``names_filter`` 给定时（已选子集）只看这些名字，不看源/目标全集的并集——这些名字本就
+    取自源的对象名单，故不会出现「仅目标有」。
+    """
     src_set, tgt_set = set(src_names), set(tgt_names)
     items: list[CompareItem] = []
     counts = {"source_only": 0, "target_only": 0, "both": 0}
-    for name in sorted(src_set | tgt_set, key=lambda x: x.lower()):
+    universe = names_filter if names_filter is not None else (src_set | tgt_set)
+    for name in sorted(universe, key=lambda x: x.lower()):
         in_s, in_t = name in src_set, name in tgt_set
         status = "both" if (in_s and in_t) else "source_only" if in_s else "target_only"
         items.append(CompareItem(name=name, status=status))
@@ -151,8 +177,13 @@ def _compare_names(src_names: list[str], tgt_names: list[str]) -> CompareTargetR
     )
 
 
-def _compare_pair(object_type: str, src_index: dict, tgt_index: dict) -> CompareTargetResult:
-    """据源 / 目标两份快照索引，产出逐对象四分类结果（不含实例标识，由调用方补齐）。"""
+def _compare_pair(
+    object_type: str, src_index: dict, tgt_index: dict, names_filter: set[str] | None = None
+) -> CompareTargetResult:
+    """据源 / 目标两份快照索引，产出逐对象四分类结果（不含实例标识，由调用方补齐）。
+
+    ``names_filter`` 给定时（已选子集）只看这些名字，理由同 :func:`_compare_names`。
+    """
     src_names, src_snaps = src_index["names"], src_index["snaps"]
     tgt_names, tgt_snaps = tgt_index["names"], tgt_index["snaps"]
     src_set, tgt_set = set(src_names), set(tgt_names)
@@ -160,7 +191,8 @@ def _compare_pair(object_type: str, src_index: dict, tgt_index: dict) -> Compare
     items: list[CompareItem] = []
     counts = {"source_only": 0, "target_only": 0, "identical": 0, "different": 0, "error": 0}
 
-    for name in sorted(src_set | tgt_set, key=lambda x: x.lower()):
+    universe = names_filter if names_filter is not None else (src_set | tgt_set)
+    for name in sorted(universe, key=lambda x: x.lower()):
         in_s, in_t = name in src_set, name in tgt_set
         s_status, s_snap, s_err = src_snaps.get(name, ("error", {}, "源快照缺失"))
         t_status, t_snap, t_err = tgt_snaps.get(name, ("error", {}, "目标快照缺失"))
@@ -217,20 +249,34 @@ def compare(
     target_instance_ids: list[int],
     names_only: bool = False,
     force: bool = False,
+    object_names: list[str] | None = None,
 ) -> BatchCompareResult:
     """把源实例某类对象逐个目标做只读对比。
 
     ``names_only=True`` 时只比对象名单（仅源有 / 仅目标有 / 两边都有），不拉详情、秒级；
     否则比名单 + 内容（仅源有 / 仅目标有 / 一致 / 不一致）。
+
+    ``object_names`` 给定时只对比这个子集（「已选对象」场景），不再对比源上全部——内容对比
+    还会跳过全量快照缓存、直接按这几个名字拉取，选得越少越快。已选子集**不直接信任**——
+    仍会现取一次源名单核对，选中但源上其实已不存在的名字（前端名单缓存滞后，或恰好被
+    别人删除）标记为 ``error`` 而非误判成 ``both``/``source_only``。
     """
     source_inst = instance_service.get_instance(db, source_instance_id)
     if not source_inst:
         raise ValueError("源实例不存在")
 
-    # 仅名单：只取名单、不拉详情，也不走快照缓存
+    # 仅名单：只取名单、不拉详情，也不走快照缓存。已选子集仍需现取一次源名单核对存在性——
+    # 这只是一次名单接口调用（不逐个拉详情），代价和「全量」路径本来就要付的一样，不算破坏
+    # 「选得越少越快」这个目标（真正要省的是逐对象详情拉取，不是这一次名单调用）。
     if names_only:
-        src_names = _list_names(source_inst, object_type)
-        src_set = set(src_names)
+        current_src_names = _list_names(source_inst, object_type)
+        if object_names:
+            current_set = set(current_src_names)
+            stale = [n for n in object_names if n not in current_set]
+            src_names = [n for n in object_names if n in current_set]
+        else:
+            stale = []
+            src_names = current_src_names
         targets: list[CompareTargetResult] = []
         for tid in target_instance_ids:
             if tid == source_instance_id:
@@ -246,20 +292,34 @@ def compare(
                     CompareTargetResult(instance_id=tid, instance_name=target_inst.name, error=f"读取目标失败：{exc}")
                 )
                 continue
-            result = _compare_names(src_names, tgt_names)
+            result = _compare_names(src_names, tgt_names, names_filter=set(src_names) if object_names else None)
+            for n in stale:
+                result.items.append(
+                    CompareItem(name=n, status="error", error="已选对象在源实例上已不存在（可能刚被删除，请刷新对象列表）")
+                )
+                result.error_count += 1
             result.instance_id = tid
             result.instance_name = target_inst.name
             targets.append(result)
         return BatchCompareResult(
             object_type=object_type,
             source_instance_id=source_instance_id,
-            source_count=len(src_set),
+            source_count=len(src_names) if object_names else len(set(src_names)),
             names_only=True,
             targets=targets,
         )
 
-    # 内容：拉两边全部对象快照（带缓存）做名单 + 字段/规则级比较
-    src_index, src_cached, src_age = _index(source_inst, object_type, force=force)
+    # 内容：已选子集时跳过全量快照缓存、按给定名字直接拉；否则拉两边全部对象快照（带缓存）。
+    # 子集里若有名字其实在源上已不存在，_fetch_index/_build_snapshot 会拉到 not_found、
+    # 该名字不进 src_index["names"]；下面 _compare_pair 据此把它判成 error 而非误报，
+    # 不需要像「仅名单」路径那样额外核对——这里本来就会逐个真实读一次。
+    names_filter = set(object_names) if object_names else None
+    if object_names:
+        source_web = session_pool.get_web_client(source_inst)
+        src_index = _fetch_index(source_web, object_type, names=object_names)
+        src_cached, src_age = False, 0
+    else:
+        src_index, src_cached, src_age = _index(source_inst, object_type, force=force)
     targets = []
     for tid in target_instance_ids:
         if tid == source_instance_id:
@@ -269,13 +329,16 @@ def compare(
             targets.append(CompareTargetResult(instance_id=tid, instance_name=f"#{tid}", error="目标实例不存在"))
             continue
         try:
-            tgt_index, _cached, _age = _index(target_inst, object_type, force=force)
+            if object_names:
+                tgt_index = _fetch_index(session_pool.get_web_client(target_inst), object_type, names=object_names)
+            else:
+                tgt_index, _cached, _age = _index(target_inst, object_type, force=force)
         except Exception as exc:  # noqa: BLE001  连接/登录/拉取失败
             targets.append(
                 CompareTargetResult(instance_id=tid, instance_name=target_inst.name, error=f"读取目标失败：{exc}")
             )
             continue
-        result = _compare_pair(object_type, src_index, tgt_index)
+        result = _compare_pair(object_type, src_index, tgt_index, names_filter=names_filter)
         result.instance_id = tid
         result.instance_name = target_inst.name
         targets.append(result)
@@ -283,7 +346,7 @@ def compare(
     return BatchCompareResult(
         object_type=object_type,
         source_instance_id=source_instance_id,
-        source_count=len(src_index["names"]),
+        source_count=len(object_names) if object_names else len(src_index["names"]),
         names_only=False,
         source_cached=src_cached,
         source_cache_age_seconds=src_age,

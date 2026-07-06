@@ -194,7 +194,8 @@ export const syncApi = {
     dry_run: boolean;
     allow_degrade?: boolean;
   }) => http.post<SyncApplyResult>("/sync/apply", body, { timeout: 300000 }).then((r) => r.data),
-  // 批量同步整类对象；mirror=true 时删除目标多余对象。建索引/逐条写较慢，放宽超时。
+  // 批量同步整类对象（或 object_names 给定的已选子集）；mirror=true 时删除目标多余对象
+  // （与子集互斥，仅支持「全部对象」）。建索引/逐条写较慢，放宽超时。
   batch: (body: {
     object_type: ObjectType;
     source_instance_id: number;
@@ -203,15 +204,18 @@ export const syncApi = {
     mirror: boolean;
     dry_run: boolean;
     allow_degrade?: boolean;
+    object_names?: string[];
   }) => http.post<BatchSyncResult>("/sync/batch", body, { timeout: 300000 }).then((r) => r.data),
   // 只读对比：names_only=true 只比名单（仅源/仅目标/两边都有，秒级）；否则比内容
-  // （仅源/仅目标/一致/不一致，逐对象拉快照较慢，放宽超时）。
+  // （仅源/仅目标/一致/不一致，逐对象拉快照较慢，放宽超时）。object_names 给定时只对比
+  // 这个已选子集，跳过全量索引缓存、按名字直拉，选得越少越快。
   compare: (body: {
     object_type: ObjectType;
     source_instance_id: number;
     target_instance_ids: number[];
     names_only?: boolean;
     force?: boolean;
+    object_names?: string[];
   }) => http.post<BatchCompareResult>("/sync/compare", body, { timeout: 300000 }).then((r) => r.data),
 };
 

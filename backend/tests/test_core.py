@@ -1471,6 +1471,48 @@ def test_batch_sync_mirror_deletes_extra_target_objects(monkeypatch):
     assert set(target_web.deleted) == {"c", "d"}  # 真实调用了删除接口
 
 
+def test_batch_sync_object_names_subset_only_touches_selected(monkeypatch):
+    """object_names 给定「已选子集」时只处理这几个名字，不管源上实际还有别的对象。"""
+    sync_service, target_web = _setup_batch(monkeypatch, ["a", "b", "c"], ["b", "c", "d"])
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="customrule", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=False, dry_run=True,
+        object_names=["a"],
+    )
+    assert res.source_count == 1
+    t = res.targets[0]
+    assert t.created == ["a"] and t.updated == []  # b、c 不在已选子集里，不处理
+
+
+def test_batch_sync_object_names_flags_stale_selection_as_failed(monkeypatch):
+    """已选子集里有个名字其实源上已不存在（比如刚被删）：标记为失败，不误报「将新增」。"""
+    sync_service, target_web = _setup_batch(monkeypatch, ["a", "b"], ["b"])
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="customrule", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=False, dry_run=True,
+        object_names=["a", "ghost"],  # "ghost" 已不在源上（源实际只有 a、b）
+    )
+    assert res.source_count == 1  # 只有验证过真实存在的 "a" 算数
+    t = res.targets[0]
+    assert t.created == ["a"]
+    assert [f.name for f in t.failed] == ["ghost"]
+    assert "已不存在" in t.failed[0].message
+
+
+def test_batch_sync_object_names_with_mirror_raises(monkeypatch):
+    """已选子集与镜像模式互斥：同时给会拒绝，避免把未选中但双方都存在的对象误删。"""
+    sync_service, _ = _setup_batch(monkeypatch, ["a", "b"], ["b", "c"])
+    user = type("U", (), {"username": "admin"})()
+    with pytest.raises(ValueError):
+        sync_service.batch_sync(
+            db=None, user=user, object_type="customrule", source_instance_id=1,
+            target_instance_ids=[2], push_all=False, mirror=True, dry_run=False,
+            object_names=["a"],
+        )
+
+
 class _PolicyMirrorWeb:
     """策略镜像测试替身：按名单列策略、记录删除调用与删前快照读取。"""
 
@@ -1746,6 +1788,93 @@ def test_compare_names_only_three_buckets(monkeypatch):
     assert (t.source_only, t.target_only, t.both) == (1, 1, 2)
     by = {it.name: it.status for it in t.items}
     assert by == {"a": "source_only", "b": "both", "c": "both", "d": "target_only"}
+
+
+def test_compare_object_names_subset_names_only(monkeypatch):
+    """仅名单对比 + 已选子集：universe 收窄为这些名字，目标上的额外对象不算「仅目标有」。"""
+    from app.services import compare_service
+
+    class _Inst:
+        def __init__(self, i, n):
+            self.id, self.name = i, n
+
+    insts = {1: _Inst(1, "源"), 2: _Inst(2, "目标")}
+    monkeypatch.setattr(compare_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    names = {1: ["a", "b", "c"], 2: ["b", "z"]}
+    monkeypatch.setattr(compare_service, "_list_names", lambda inst, ot: names[inst.id])
+
+    res = compare_service.compare(
+        db=None, object_type="url", source_instance_id=1, target_instance_ids=[2],
+        names_only=True, object_names=["a", "b"],
+    )
+    assert res.source_count == 2
+    t = res.targets[0]
+    by = {it.name: it.status for it in t.items}
+    assert by == {"a": "source_only", "b": "both"}  # 没有 z（目标额外）、也没有 c（子集之外）
+
+
+def test_compare_object_names_subset_flags_stale_as_error(monkeypatch):
+    """仅名单对比 + 已选子集：子集里有个名字源上其实已不存在，标记为 error，不误判 both/source_only。"""
+    from app.services import compare_service
+
+    class _Inst:
+        def __init__(self, i, n):
+            self.id, self.name = i, n
+
+    insts = {1: _Inst(1, "源"), 2: _Inst(2, "目标")}
+    monkeypatch.setattr(compare_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    # 目标恰好也有个同名 "ghost"——验证不会因为目标有就被误判成 both
+    names = {1: ["a", "b"], 2: ["b", "ghost"]}
+    monkeypatch.setattr(compare_service, "_list_names", lambda inst, ot: names[inst.id])
+
+    res = compare_service.compare(
+        db=None, object_type="url", source_instance_id=1, target_instance_ids=[2],
+        names_only=True, object_names=["a", "ghost"],  # "ghost" 已不在源上（源实际只有 a、b）
+    )
+    assert res.source_count == 1  # 只有验证过真实存在的 "a" 算数
+    t = res.targets[0]
+    by = {it.name: it.status for it in t.items}
+    assert by["a"] == "source_only"
+    assert by["ghost"] == "error"
+
+
+def test_compare_object_names_subset_content(monkeypatch):
+    """内容对比 + 已选子集：跳过全量索引缓存直接按名字拉，universe 同样收窄为已选子集。"""
+    from app.services import compare_service
+
+    class _Inst:
+        def __init__(self, i, n):
+            self.id, self.name = i, n
+
+    insts = {1: _Inst(1, "源"), 2: _Inst(2, "目标")}
+    monkeypatch.setattr(compare_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    monkeypatch.setattr(compare_service.session_pool, "get_web_client", lambda inst: inst)
+
+    src_full = {"names": ["a", "b", "c"], "snaps": {
+        "a": ("found", {"name": "a", "url": "x"}, ""),
+        "b": ("found", {"name": "b", "url": "same"}, ""),
+    }}
+    # 目标另有 "z"（不在已选子集里）——不应作为「仅目标有」冒出来
+    tgt_full = {"names": ["b", "z"], "snaps": {
+        "b": ("found", {"name": "b", "url": "same"}, ""),
+        "z": ("found", {"name": "z", "url": "extra"}, ""),
+    }}
+
+    def fake_fetch(web, ot, names=None):
+        idx = src_full if web is insts[1] else tgt_full
+        picked = [n for n in idx["names"] if n in (names or idx["names"])]
+        return {"names": picked, "snaps": {n: idx["snaps"][n] for n in picked}}
+
+    monkeypatch.setattr(compare_service, "_fetch_index", fake_fetch)
+
+    res = compare_service.compare(
+        db=None, object_type="url", source_instance_id=1, target_instance_ids=[2],
+        object_names=["a", "b"],
+    )
+    assert res.source_count == 2
+    t = res.targets[0]
+    by = {it.name: it.status for it in t.items}
+    assert by == {"a": "source_only", "b": "identical"}  # 没有 z
 
 
 def _pol(name, rules, *, enable=True, app_inc=True, net_inc=False, net_rules=None, proxy_inc=False, proxy=None):

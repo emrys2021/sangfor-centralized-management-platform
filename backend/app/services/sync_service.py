@@ -489,12 +489,21 @@ def batch_sync(
     mirror: bool,
     dry_run: bool,
     allow_degrade: bool = False,
+    object_names: list[str] | None = None,
 ) -> BatchSyncResult:
-    """把源实例某类对象的**全部**同步到目标：逐对象 upsert；``mirror`` 时删除目标多余对象。
+    """把源实例某类对象同步到目标：逐对象 upsert；``mirror`` 时删除目标多余对象。
+
+    ``object_names`` 不给时同步源上**全部**对象；给定时只同步这个「已选」子集。**不直接信任**
+    传入的子集——仍会现取一次源名单核对存在性（只是一次列表调用，不逐个拉详情，代价与「全部」
+    路径本来就要付的一样），选中但源上其实已不存在的名字（前端名单缓存滞后，或恰好被别人删除）
+    在每个目标下都记为 ``failed``，不会被当成「将新增/更新」误报。
 
     复用单对象写路径（``_write_to_target``），自定义应用/URL 直写、策略带 crc 重映射与自动
     建引用。性能：源对象列表与（策略用的）源自定义名单各预读一次；每个目标的应用树索引建一次、
     复用给该目标的每条策略。
+
+    **镜像与已选子集互斥**：镜像要求以源的全集为基准判定「目标多余」，若同时传入子集，会把
+    「没被选中、但双方都合法存在」的目标对象误判成多余而删除，故两者同时为真时直接拒绝。
 
     镜像删除的安全措施（仅真实执行时生效；dry-run 预览**不做引用校验**、只按名称列候选名单，
     遍历组织树的校验较慢、放进预览会拖慢秒回体验——真实执行时才校验，故候选名单与实际删除结果
@@ -507,11 +516,20 @@ def batch_sync(
     - 每个被删对象删除前读取完整详情作为快照，随删除动作单独落一条审计（``before`` 字段），
       误删后可按快照内容重建。
     """
+    if object_names and mirror:
+        raise ValueError("镜像模式仅支持「全部对象」，选中部分对象时请取消镜像或改选全部对象")
     source_inst = instance_service.get_instance(db, source_instance_id)
     if not source_inst:
         raise ValueError("源实例不存在")
     source_web = session_pool.get_web_client(source_inst)
-    source_names = _list_object_names(source_web, object_type)
+    current_source_names = _list_object_names(source_web, object_type)
+    if object_names:
+        current_set = set(current_source_names)
+        stale_names = [n for n in object_names if n not in current_set]
+        source_names = [n for n in object_names if n in current_set]
+    else:
+        stale_names = []
+        source_names = current_source_names
     source_name_set = set(source_names)
 
     # 策略：源自定义应用 / URL 名单预读一次（供 crc 重映射的自动建引用使用）。
@@ -563,7 +581,10 @@ def batch_sync(
         created: list[str] = []
         updated: list[str] = []
         deleted: list[str] = []
-        failed: list[BatchObjectResult] = []
+        failed: list[BatchObjectResult] = [
+            BatchObjectResult(name=n, action="fail", ok=False, message="已选对象在源实例上已不存在（可能刚被删除，请刷新对象列表后重试）")
+            for n in stale_names
+        ]
         details: list[BatchObjectResult] = []
 
         # 1) upsert：目标已有同名→更新（覆盖为与源一致），否则新增。

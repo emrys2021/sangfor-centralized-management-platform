@@ -92,6 +92,10 @@ class BatchSyncRequest(BaseModel):
     dry_run: bool = True
     # 策略：允许写入「降级（丢弃了目标缺失引用、与源不等价）」的策略；默认拒绝（见 SyncApplyRequest）。
     allow_degrade: bool = False
+    # 只同步「已选」的一部分对象（不给则同步源上全部）。与 mirror 互斥——镜像要求以源的
+    # **全集**为基准判断目标多余对象，选中子集时贸然镜像会把「没被选中但双方都合法存在」的
+    # 目标对象误删，故服务层会在两者同时为真时拒绝。
+    object_names: list[str] | None = None
 
 
 class BatchObjectResult(BaseModel):
@@ -132,6 +136,10 @@ class BatchCompareRequest(BaseModel):
     # False：比名单 + 内容（仅源有 / 仅目标有 / 一致 / 不一致）。
     names_only: bool = False
     force: bool = False  # True 时绕过快照缓存强制重新拉取
+    # 只对比「已选」的一部分对象（不给则对比源上全部）。给定时不再走全量索引缓存，直接按
+    # 名字并行拉这几个对象，选得越少越快；universe 也收窄为这些名字（不会冒出「仅目标有」，
+    # 因为这些名字本就来自源的对象名单）。
+    object_names: list[str] | None = None
 
 
 class CompareItem(BaseModel):
