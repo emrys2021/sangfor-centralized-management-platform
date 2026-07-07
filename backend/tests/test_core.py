@@ -957,16 +957,17 @@ def _sample_app_tree():
                 "type": "catagory",
                 "children": [
                     {
+                        # 真实设备形态（据杭州/深圳 AC 实测）：URL 库节点 type=app 带 value；
+                        # 能力子类 type=power、value 为 **null**（引用路径需按「父 value/子 name」
+                        # 合成）、crc 为「父crc_能力序号」。曾因样例把子类 value 想当然填成完整
+                        # 路径，索引查不到真实设备三段式引用的 bug 未被测试暴露。
                         "name": "钉钉白名单",
-                        "type": "catagory",
+                        "type": "app",
+                        "value": "访问网站/钉钉白名单",
+                        "crc": "T-3000",
                         "children": [
-                            {
-                                "name": "网站浏览",
-                                "type": "power",
-                                "value": "访问网站/钉钉白名单/网站浏览",
-                                "crc": "T-3003",
-                                "extra": "url",
-                            },
+                            {"name": "网站浏览", "type": "power", "value": None, "crc": "T-3000_1", "extra": "url"},
+                            {"name": "HTTPS", "type": "power", "value": None, "crc": "T-3000_5", "extra": "url"},
                         ],
                     },
                 ],
@@ -982,9 +983,13 @@ def test_build_app_index_flattens_tree_with_crc():
     index = build_app_index(_sample_app_tree())
     assert index["Web流媒体/全部"]["crc"] == "T-1001"
     assert index["自定义/钉钉应用"] == {"crc": "T-2002", "type": "app"}
-    assert index["访问网站/钉钉白名单/网站浏览"]["crc"] == "T-3003"
-    # 仅带 value 的节点入索引（分类节点无 value 不入）
+    # URL 库节点（带 value）与其能力子类（value=null → 按「父 value/子 name」合成 key）
+    assert index["访问网站/钉钉白名单"]["crc"] == "T-3000"
+    assert index["访问网站/钉钉白名单/网站浏览"] == {"crc": "T-3000_1", "type": "power"}
+    assert index["访问网站/钉钉白名单/HTTPS"]["crc"] == "T-3000_5"
+    # 分类节点无 value 且非 power，不入索引
     assert "Web流媒体" not in index
+    assert "访问网站" not in index
 
 
 def _source_policy_detail():
@@ -1053,7 +1058,8 @@ def test_build_remapped_rules_maps_crc_to_target():
     assert rules[0]["name"] == "rule-src-1"
     assert rules[0]["action"] is False
     crcs = [r["crc"] for r in rules[0]["refs"]]
-    assert crcs == ["T-2002", "T-3003"]  # 源 S-9001/S-9002 → 目标 crc
+    # 源 S-9001/S-9002 → 目标 crc；能力级引用经合成 key 命中 power 子节点自己的 crc
+    assert crcs == ["T-2002", "T-3000_1"]
 
 
 def test_classify_missing_splits_creatable_and_builtin():
@@ -1158,7 +1164,7 @@ def test_sync_policy_modify_uses_proven_contract_when_exists():
     )
     assert len(target.modify_calls) == 1 and not target.create_policy_calls
     _, rules, _ = target.modify_calls[0]
-    assert [r["crc"] for r in rules[0]["refs"]] == ["T-2002", "T-3003"]
+    assert [r["crc"] for r in rules[0]["refs"]] == ["T-2002", "T-3000_1"]
     assert out["missing"] == [] and out["created"] == []
 
 
@@ -1174,7 +1180,7 @@ def test_sync_policy_add_uses_create_policy_when_absent():
     assert len(target.create_policy_calls) == 1 and not target.modify_calls
     data, _ = target.create_policy_calls[0]
     refs = data["appctrl"]["application"]["data"][0]["apps"]["apps"]
-    assert [r["crc"] for r in refs] == ["T-2002", "T-3003"]
+    assert [r["crc"] for r in refs] == ["T-2002", "T-3000_1"]
     # 用 policy_template 骨架：带骨架默认字段、规则 ID 由模板生成（不是源 rule_id）
     assert data["type"] == 1 and "samerole" in data and data["name"] == "测试策略"
     assert data["appctrl"]["application"]["data"][0]["name"] != "rule-src-1"
@@ -1193,16 +1199,13 @@ def test_sync_policy_dry_run_previews_autocreate_without_blocking():
                 "type": "catagory",
                 "children": [
                     {
+                        # 真实形态：URL 库节点带 value，能力子类 value=null（key 由索引合成）
                         "name": "钉钉白名单",
-                        "type": "catagory",
+                        "type": "app",
+                        "value": "访问网站/钉钉白名单",
+                        "crc": "T-3000",
                         "children": [
-                            {
-                                "name": "网站浏览",
-                                "type": "power",
-                                "value": "访问网站/钉钉白名单/网站浏览",
-                                "crc": "T-3003",
-                                "extra": "url",
-                            },
+                            {"name": "网站浏览", "type": "power", "value": None, "crc": "T-3000_1", "extra": "url"},
                         ],
                     }
                 ],
@@ -1227,9 +1230,10 @@ def test_sync_policy_updates_existing_referenced_object_not_add():
     partial_tree = {
         "data": [
             {"name": "访问网站", "type": "catagory", "children": [
-                {"name": "钉钉白名单", "type": "catagory", "children": [
-                    {"name": "网站浏览", "type": "power", "value": "访问网站/钉钉白名单/网站浏览",
-                     "crc": "T-3003", "extra": "url"}]}]},
+                {"name": "钉钉白名单", "type": "app", "value": "访问网站/钉钉白名单", "crc": "T-3000",
+                 "children": [
+                    {"name": "网站浏览", "type": "power", "value": None,
+                     "crc": "T-3000_1", "extra": "url"}]}]},
         ]
     }
     # 目标已存在同名自定义应用「钉钉应用」
@@ -1272,9 +1276,10 @@ def test_sync_policy_real_write_skips_builtin_missing():
             {"name": "自定义", "type": "catagory", "children": [
                 {"name": "钉钉应用", "type": "app", "value": "自定义/钉钉应用", "crc": "T-2002"}]},
             {"name": "访问网站", "type": "catagory", "children": [
-                {"name": "钉钉白名单", "type": "catagory", "children": [
-                    {"name": "网站浏览", "type": "power", "value": "访问网站/钉钉白名单/网站浏览",
-                     "crc": "T-3003", "extra": "url"}]}]},
+                {"name": "钉钉白名单", "type": "app", "value": "访问网站/钉钉白名单", "crc": "T-3000",
+                 "children": [
+                    {"name": "网站浏览", "type": "power", "value": None,
+                     "crc": "T-3000_1", "extra": "url"}]}]},
         ]
     }
     target = _FakeTargetWeb(partial_tree, has_policy=True)

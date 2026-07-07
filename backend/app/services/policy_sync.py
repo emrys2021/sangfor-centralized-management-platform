@@ -32,26 +32,39 @@ def _split_path(path: str) -> list[str]:
 
 
 def build_app_index(tree: dict) -> dict[str, dict]:
-    """把目标 ``listAppTree`` 结果展平为 ``path(value) -> {crc, type}`` 索引。
+    """把目标 ``listAppTree`` 结果展平为 ``path -> {crc, type}`` 索引。
 
-    遍历整棵树（含 ``children``），对每个带 ``value`` 的节点登记其 ``crc`` / ``type``。
-    同一 ``value`` 多次出现时以**首次**为准（树中路径应唯一）。供按引用路径 O(1) 查目标 crc。
+    遍历整棵树（含 ``children``），对每个带 ``value`` 的节点以 ``value`` 为 key 登记其
+    ``crc`` / ``type``。同一 key 多次出现时以**首次**为准（树中路径应唯一）。供按引用
+    路径 O(1) 查目标 crc。
+
+    **URL 库能力子类**（``type=power``，即库节点下的 网站浏览/文件上传/其他上传/HTTPS）
+    的 ``value`` 为 null、自身不带完整路径——策略详情里的能力级引用却是三段式
+    ``访问网站/<库名>/<能力名>``。故对这类节点用「父节点 value + ``/`` + 子节点 name」
+    合成 key 登记（crc 用子节点自己的，如 ``<父crc>_5``）；否则能力级引用在**任何**目标
+    上都查不到、被误判为「目标缺失」而拒绝同步。
     """
     index: dict[str, dict] = {}
 
-    def walk(nodes) -> None:
+    def register(key: str, node: dict) -> None:
+        if key not in index:
+            index[key] = {
+                "crc": "" if node.get("crc") is None else str(node.get("crc")),
+                "type": "" if node.get("type") is None else str(node.get("type")),
+            }
+
+    def walk(nodes, parent_value: str = "") -> None:
         if not isinstance(nodes, list):
             return
         for node in nodes:
             if not isinstance(node, dict):
                 continue
             value = node.get("value")
-            if value and str(value) not in index:
-                index[str(value)] = {
-                    "crc": "" if node.get("crc") is None else str(node.get("crc")),
-                    "type": "" if node.get("type") is None else str(node.get("type")),
-                }
-            walk(node.get("children"))
+            if value:
+                register(str(value), node)
+            elif node.get("type") == "power" and node.get("name") and parent_value:
+                register(f"{parent_value}/{node['name']}", node)
+            walk(node.get("children"), str(value) if value else "")
 
     walk(tree.get("data"))
     return index
