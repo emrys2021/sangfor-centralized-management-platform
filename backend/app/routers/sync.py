@@ -61,6 +61,7 @@ def batch_sync(
             dry_run=req.dry_run,
             allow_degrade=req.allow_degrade,
             object_names=req.object_names,
+            delete_names=req.delete_names,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

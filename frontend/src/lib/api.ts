@@ -194,8 +194,9 @@ export const syncApi = {
     dry_run: boolean;
     allow_degrade?: boolean;
   }) => http.post<SyncApplyResult>("/sync/apply", body, { timeout: 300000 }).then((r) => r.data),
-  // 批量同步整类对象（或 object_names 给定的已选子集）；mirror=true 时删除目标多余对象
-  // （与子集互斥，仅支持「全部对象」）。建索引/逐条写较慢，放宽超时。
+  // 批量同步整类对象（或 object_names 给定的已选子集：None=全部、[]=一个都不推、[names]=只推这些）；
+  // mirror=true 删除目标全部多余对象（与子集互斥、仅「全部对象」）；delete_names=只删指定的目标多余对象
+  // （来自对比「仅目标有」勾选，走镜像同一套安全闸，与 mirror 互斥）。建索引/逐条写较慢，放宽超时。
   batch: (body: {
     object_type: ObjectType;
     source_instance_id: number;
@@ -205,6 +206,7 @@ export const syncApi = {
     dry_run: boolean;
     allow_degrade?: boolean;
     object_names?: string[];
+    delete_names?: string[];
   }) => http.post<BatchSyncResult>("/sync/batch", body, { timeout: 300000 }).then((r) => r.data),
   // 只读对比：names_only=true 只比名单（仅源/仅目标/两边都有，秒级）；否则比内容
   // （仅源/仅目标/一致/不一致，逐对象拉快照较慢，放宽超时）。object_names 给定时只对比

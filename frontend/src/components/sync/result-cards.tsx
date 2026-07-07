@@ -1,12 +1,13 @@
 // 右侧结果区的三种卡片：单对象同步结果（ApplyResultCard，含重建报文+缺失引用告警）、
-// 批量同步逐目标结果（BatchResultCard）、全量对比分类结果（CompareResultCard，可展开明细）。
-import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
-import { useState } from "react";
+// 批量同步逐目标结果（BatchResultCard）、全量对比分类结果（CompareResultCard，可勾选后暂存应用）。
+import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
 import { JsonView } from "@/components/common";
 import { ObjectDiffBody } from "@/components/sync/object-diff";
 import { SnapshotView } from "@/components/sync/snapshot";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import type {
   BatchTargetResult,
   CompareItem,
@@ -210,30 +211,61 @@ const COMPARE_META: Record<CompareStatus, { label: string; cls: string }> = {
   identical: { label: "内容一致", cls: "text-muted-foreground/60" },
 };
 
-// 单个对象行：可展开明细（不一致→字段/规则 diff；仅源/仅目标→只读快照）。
-function CompareItemRow({ item, objectType }: { item: CompareItem; objectType: ObjectType }) {
+// 可勾选并暂存后同步/删除的对比结果卡片：
+// - 推送类（仅源有=新增、不一致=覆盖、一致=无意义覆盖、仅名单的两边都有=覆盖）勾选后走「同步选中」；
+// - 删除类（仅目标有=源没有、目标多出）勾选后走「删除选中」（破坏性，与镜像同一套安全闸）。
+// error 行不可选（无法可靠判定/操作）。
+const PUSH_STATUSES = new Set<CompareStatus>(["source_only", "different", "identical", "both"]);
+const isSelectable = (s: CompareStatus) => PUSH_STATUSES.has(s) || s === "target_only";
+
+// 单个对象行：可选（勾选框）+ 可展开明细（不一致→字段/规则 diff；仅源/仅目标→只读快照）。
+function CompareItemRow({
+  item,
+  objectType,
+  checked,
+  onToggle,
+}: {
+  item: CompareItem;
+  objectType: ObjectType;
+  checked: boolean;
+  onToggle?: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const expandable =
     (item.status === "different" && !!item.source_snapshot) ||
     (item.status === "source_only" && !!item.source_snapshot) ||
     (item.status === "target_only" && !!item.target_snapshot);
+  const selectable = isSelectable(item.status) && !!onToggle;
   return (
     <div className="rounded border border-border/40">
-      <button
-        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-muted/20 transition-colors disabled:cursor-default disabled:hover:bg-transparent"
-        onClick={() => expandable && setOpen((v) => !v)}
-        disabled={!expandable}
-      >
-        {expandable ? (
-          open ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />
+      <div className="flex w-full items-center gap-2 px-2.5 py-1.5 text-xs">
+        {selectable ? (
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={onToggle}
+            className={`h-3.5 w-3.5 shrink-0 ${item.status === "target_only" ? "accent-red-500" : "accent-primary"}`}
+            title={item.status === "target_only" ? "勾选后可删除（源上没有）" : "勾选后可同步到目标"}
+          />
         ) : (
-          <span className="w-3 shrink-0" />
+          <span className="w-3.5 shrink-0" />
         )}
-        <span className={`break-all ${item.status === "identical" ? "text-muted-foreground/70" : "font-medium"}`}>
-          {item.name}
-        </span>
-        {item.status === "error" && item.error && <span className="text-red-400/80">— {item.error}</span>}
-      </button>
+        <button
+          className="flex flex-1 items-center gap-2 text-left transition-colors hover:text-foreground disabled:cursor-default"
+          onClick={() => expandable && setOpen((v) => !v)}
+          disabled={!expandable}
+        >
+          {expandable ? (
+            open ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />
+          ) : (
+            <span className="w-3 shrink-0" />
+          )}
+          <span className={`break-all ${item.status === "identical" ? "text-muted-foreground/70" : "font-medium"}`}>
+            {item.name}
+          </span>
+          {item.status === "error" && item.error && <span className="text-red-400/80">— {item.error}</span>}
+        </button>
+      </div>
       {open && expandable && (
         <div className="border-t border-border/40 px-2.5 py-2">
           {item.status === "different" && item.source_snapshot ? (
@@ -254,35 +286,65 @@ function CompareItemRow({ item, objectType }: { item: CompareItem; objectType: O
   );
 }
 
-// 一个分类分组（如「内容不一致」）：可折叠，列出该类下所有对象行。
+// 一个分类分组（如「内容不一致」）：可折叠；可选组带「全选」勾选框（半选态用 indeterminate）。
 function CompareGroup({
   status,
   items,
   objectType,
   defaultOpen,
+  selectedNames,
+  onToggleItem,
+  onToggleGroup,
 }: {
   status: CompareStatus;
   items: CompareItem[];
   objectType: ObjectType;
   defaultOpen: boolean;
+  selectedNames?: Set<string>;
+  onToggleItem?: (name: string) => void;
+  onToggleGroup?: (names: string[], select: boolean) => void;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   if (items.length === 0) return null;
   const meta = COMPARE_META[status];
+  const selectable = isSelectable(status) && !!onToggleGroup;
+  const selCount = selectedNames ? items.filter((i) => selectedNames.has(i.name)).length : 0;
+  const allSel = selCount === items.length;
   return (
     <div className="space-y-1">
-      <button
-        className="flex items-center gap-1 text-xs font-medium hover:opacity-80 transition-opacity"
-        onClick={() => setOpen((v) => !v)}
-      >
-        {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-        <span className={meta.cls}>{meta.label}</span>
-        <span className="text-muted-foreground/50">{items.length}</span>
-      </button>
+      <div className="flex items-center gap-1.5">
+        {selectable ? (
+          <input
+            type="checkbox"
+            checked={allSel}
+            ref={(el) => el && (el.indeterminate = selCount > 0 && !allSel)}
+            onChange={() => onToggleGroup!(items.map((i) => i.name), !allSel)}
+            className={`h-3.5 w-3.5 shrink-0 ${status === "target_only" ? "accent-red-500" : "accent-primary"}`}
+            title={status === "target_only" ? "全选本组以删除" : "全选本组以同步"}
+          />
+        ) : (
+          <span className="w-3.5 shrink-0" />
+        )}
+        <button
+          className="flex items-center gap-1 text-xs font-medium hover:opacity-80 transition-opacity"
+          onClick={() => setOpen((v) => !v)}
+        >
+          {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+          <span className={meta.cls}>{meta.label}</span>
+          <span className="text-muted-foreground/50">{items.length}</span>
+          {selectable && selCount > 0 && <span className="text-muted-foreground/40">· 选中 {selCount}</span>}
+        </button>
+      </div>
       {open && (
         <div className="space-y-1 pl-1">
           {items.map((it) => (
-            <CompareItemRow key={it.name} item={it} objectType={objectType} />
+            <CompareItemRow
+              key={it.name}
+              item={it}
+              objectType={objectType}
+              checked={!!selectedNames?.has(it.name)}
+              onToggle={onToggleItem ? () => onToggleItem(it.name) : undefined}
+            />
           ))}
         </div>
       )}
@@ -294,10 +356,17 @@ export function CompareResultCard({
   t,
   objectType,
   namesOnly,
+  onSync,
+  onDelete,
+  busy = false,
 }: {
   t: CompareTargetResult;
   objectType: ObjectType;
   namesOnly: boolean;
+  // 勾选后「同步选中/删除选中」的回调；不传则卡片为纯只读（无勾选框）。
+  onSync?: (instanceId: number, instanceName: string, names: string[]) => void;
+  onDelete?: (instanceId: number, instanceName: string, names: string[]) => void;
+  busy?: boolean;
 }) {
   // 仅名单：源/目标/都有三桶；内容：不一致/仅源/仅目标/一致四桶。
   const groups: CompareStatus[] = namesOnly
@@ -305,6 +374,35 @@ export function CompareResultCard({
     : ["different", "source_only", "target_only", "error", "identical"];
   const byStatus = (s: CompareStatus) => t.items.filter((i) => i.status === s);
   const hasNameDiff = t.source_only + t.target_only > 0;
+  const selectable = !!onSync || !!onDelete;
+
+  // 勾选态。默认预选「仅源有（将新增）+ 不一致（将覆盖）」，其余（一致/仅目标有/两边都有）留空。
+  // items 变化（新一次对比）时按签名重置——避免旧选中残留到新数据。
+  const sig = useMemo(() => t.items.map((i) => `${i.name}:${i.status}`).join("|"), [t.items]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const init = new Set<string>();
+    for (const it of t.items) if (it.status === "source_only" || it.status === "different") init.add(it.name);
+    setSelected(init);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sig]);
+
+  const toggleItem = (name: string) =>
+    setSelected((s) => {
+      const n = new Set(s);
+      n.has(name) ? n.delete(name) : n.add(name);
+      return n;
+    });
+  const toggleGroup = (names: string[], select: boolean) =>
+    setSelected((s) => {
+      const n = new Set(s);
+      names.forEach((x) => (select ? n.add(x) : n.delete(x)));
+      return n;
+    });
+
+  const pushNames = t.items.filter((i) => selected.has(i.name) && PUSH_STATUSES.has(i.status)).map((i) => i.name);
+  const delNames = t.items.filter((i) => selected.has(i.name) && i.status === "target_only").map((i) => i.name);
+
   return (
     <div className="rounded-lg border p-3 space-y-2">
       <div className="flex items-center justify-between">
@@ -354,9 +452,34 @@ export function CompareResultCard({
                 items={byStatus(s)}
                 objectType={objectType}
                 defaultOpen={s !== "identical" && s !== "both"}
+                selectedNames={selectable ? selected : undefined}
+                onToggleItem={selectable ? toggleItem : undefined}
+                onToggleGroup={selectable ? toggleGroup : undefined}
               />
             ))}
           </div>
+
+          {/* 暂存应用条：勾选后「同步选中」（推送=新增/覆盖）/「删除选中」（破坏性） */}
+          {selectable && (pushNames.length > 0 || delNames.length > 0) && (
+            <div className="sticky bottom-0 -mx-3 -mb-3 flex flex-wrap items-center gap-2 border-t bg-card/95 px-3 py-2 backdrop-blur">
+              {onSync && pushNames.length > 0 && (
+                <Button size="sm" disabled={busy} onClick={() => onSync(t.instance_id, t.instance_name, pushNames)}>
+                  <ArrowRight className="h-3.5 w-3.5" /> 同步选中 {pushNames.length} 项
+                </Button>
+              )}
+              {onDelete && delNames.length > 0 && (
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={busy}
+                  onClick={() => onDelete(t.instance_id, t.instance_name, delNames)}
+                >
+                  <Trash2 className="h-3.5 w-3.5" /> 删除选中 {delNames.length} 项
+                </Button>
+              )}
+              <span className="text-[11px] text-muted-foreground/60">→ {t.instance_name}</span>
+            </div>
+          )}
         </>
       )}
     </div>

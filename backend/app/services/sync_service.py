@@ -490,47 +490,58 @@ def batch_sync(
     dry_run: bool,
     allow_degrade: bool = False,
     object_names: list[str] | None = None,
+    delete_names: list[str] | None = None,
 ) -> BatchSyncResult:
-    """把源实例某类对象同步到目标：逐对象 upsert；``mirror`` 时删除目标多余对象。
+    """把源实例某类对象同步到目标：逐对象 upsert；``mirror`` / ``delete_names`` 时删除目标多余对象。
 
-    ``object_names`` 不给时同步源上**全部**对象；给定时只同步这个「已选」子集。**不直接信任**
-    传入的子集——仍会现取一次源名单核对存在性（只是一次列表调用，不逐个拉详情，代价与「全部」
-    路径本来就要付的一样），选中但源上其实已不存在的名字（前端名单缓存滞后，或恰好被别人删除）
-    在每个目标下都记为 ``failed``，不会被当成「将新增/更新」误报。
+    ``object_names`` 语义：``None``=推送源上**全部**对象；给定列表=只推送这个「已选」子集
+    （空列表 ``[]``=**一个都不推送**，用于「只删不推」的场景）。**不直接信任**传入的子集——
+    仍会现取一次源名单核对存在性（只是一次列表调用，不逐个拉详情），选中但源上其实已不存在的
+    名字（前端名单缓存滞后，或恰好被别人删除）在每个目标下都记为 ``failed``，不会被当成「将
+    新增/更新」误报。
+
+    删除有两种入口，二选一（互斥，同给会报错）：
+
+    - ``mirror=True``：删除目标上「源没有」的**全部**多余对象（仅「全部对象」场景，见互斥校验）。
+    - ``delete_names``：只删除**指定**的目标多余对象（来自对比结果「仅目标有」分组的勾选）。
+      同样只允许删「确属目标多余」（在目标存在、且源上没有）的对象——传入的名字若源上也有或
+      目标上不存在，一律跳过记为 ``failed``，不误删双方都合法存在的对象。
 
     复用单对象写路径（``_write_to_target``），自定义应用/URL 直写、策略带 crc 重映射与自动
     建引用。性能：源对象列表与（策略用的）源自定义名单各预读一次；每个目标的应用树索引建一次、
     复用给该目标的每条策略。
 
-    **镜像与已选子集互斥**：镜像要求以源的全集为基准判定「目标多余」，若同时传入子集，会把
-    「没被选中、但双方都合法存在」的目标对象误判成多余而删除，故两者同时为真时直接拒绝。
+    **镜像与已选子集互斥**：镜像要求以源的全集为基准判定「目标多余」，若同时传入 ``object_names``
+    子集，会把「没被选中、但双方都合法存在」的目标对象误判成多余而删除，故两者同时为真时直接拒绝。
 
-    镜像删除的安全措施（仅真实执行时生效；dry-run 预览**不做引用校验**、只按名称列候选名单，
-    遍历组织树的校验较慢、放进预览会拖慢秒回体验——真实执行时才校验，故候选名单与实际删除结果
-    可能不同：预览里的策略若在此期间被引用，真实执行时会被跳过而非删除，前端文案已标注这一点）：
+    删除的安全措施（``mirror`` 与 ``delete_names`` 共用；仅真实执行时生效；dry-run 预览**不做
+    引用校验**、只按名称列候选名单，遍历组织树的校验较慢、放进预览会拖慢秒回体验——真实执行时才
+    校验，故候选名单与实际删除结果可能不同：预览里的策略若在此期间被引用，真实执行时会被跳过而非
+    删除，前端文案已标注这一点）：
 
     - **策略**：删除前对目标做一次强制刷新的引用校验，在用（有用户引用）的策略跳过不删；
-      校验失败（部分组读不到等）时无法确认在用与否，该目标的策略镜像删除全部拒绝；校验成功
-      但结果里**没有**某个策略名（与镜像名单来自两次独立设备调用、之间可能有时间差或固件解析
+      校验失败（部分组读不到等）时无法确认在用与否，该目标的策略删除全部拒绝；校验成功
+      但结果里**没有**某个策略名（与候选名单来自两次独立设备调用、之间可能有时间差或固件解析
       差异）同样视为「无法确认」，不当作 0 引用直接删。
     - 每个被删对象删除前读取完整详情作为快照，随删除动作单独落一条审计（``before`` 字段），
       误删后可按快照内容重建。
     """
     if object_names and mirror:
         raise ValueError("镜像模式仅支持「全部对象」，选中部分对象时请取消镜像或改选全部对象")
+    if delete_names and mirror:
+        raise ValueError("镜像模式与「选择性删除」互斥：镜像已删全部多余对象，不必再指定 delete_names")
     source_inst = instance_service.get_instance(db, source_instance_id)
     if not source_inst:
         raise ValueError("源实例不存在")
     source_web = session_pool.get_web_client(source_inst)
     current_source_names = _list_object_names(source_web, object_type)
-    if object_names:
-        current_set = set(current_source_names)
-        stale_names = [n for n in object_names if n not in current_set]
-        source_names = [n for n in object_names if n in current_set]
+    full_source_set = set(current_source_names)  # 源全集：删除时据此判定「目标多余」，不受 object_names 子集影响
+    if object_names is not None:
+        stale_names = [n for n in object_names if n not in full_source_set]
+        source_names = [n for n in object_names if n in full_source_set]
     else:
         stale_names = []
         source_names = current_source_names
-    source_name_set = set(source_names)
 
     # 策略：源自定义应用 / URL 名单预读一次（供 crc 重映射的自动建引用使用）。
     # 仅真实写入时需要——dry-run 预览只按名称分类、不逐个拉详情，故跳过。
@@ -634,15 +645,30 @@ def batch_sync(
             except Exception as exc:  # noqa: BLE001  单对象失败不拖垮整体
                 failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=str(exc)))
 
-        # 2) 镜像删除：目标上源没有的对象
+        # 2) 删除目标多余对象：mirror=全部多余；delete_names=指定的多余对象（对比勾选）。
+        #    「多余」= 在目标存在、且源上没有（据 full_source_set 判定，不受 object_names 子集影响）。
+        target_extra = target_name_set - full_source_set
         if mirror:
-            extra_names = sorted(target_name_set - source_name_set)
-            # 策略镜像删除的安全闸（与「一键清理无人引用」同一取舍）：真实删除前对目标做一次
+            extra_names = sorted(target_extra)
+        elif delete_names:
+            extra_names = [n for n in delete_names if n in target_extra]
+            # 传入但「并非目标多余」的名字（源上也有=推送对象、或目标上根本没有）：跳过记 failed，
+            # 绝不删除双方都合法存在的对象。
+            for n in delete_names:
+                if n not in target_extra:
+                    reason = "源实例上也存在（属推送对象、非目标多余）" if n in full_source_set else "目标实例上不存在"
+                    failed.append(BatchObjectResult(
+                        name=n, action="fail", ok=False, message=f"未删除：{reason}",
+                    ))
+        else:
+            extra_names = []
+        if extra_names:
+            # 策略删除的安全闸（与「一键清理无人引用」同一取舍）：真实删除前对目标做一次
             # **强制刷新**的引用校验——在用策略跳过不删；校验有组读取失败/异常时数据不完整，
             # 为安全全部拒删（否则可能把仅仅是"没读到引用"的在用策略当成多余对象删掉）。
             usage_by_name: dict[str, int] = {}
             usage_error = ""
-            if extra_names and object_type == "policy" and not dry_run:
+            if object_type == "policy" and not dry_run:
                 try:
                     usage = policy_usage_service.analyze_policy_usage(target_inst, force=True)
                     errs = usage.get("errors") or []
@@ -658,11 +684,11 @@ def batch_sync(
                 if dry_run:  # 预览只列候选名单，不做引用校验、不发删除请求（校验遍历组织树较慢）；
                     # 真实执行时会重新校验引用，在用的策略届时会被跳过——预览与实际执行结果可能不同。
                     deleted.append(name)
-                    msg = "候选镜像删除（源中不存在；真实执行前会重新校验引用，在用的策略将跳过）"
+                    msg = "候选删除（源中不存在；真实执行前会重新校验引用，在用的策略将跳过）"
                     details.append(
                         BatchObjectResult(name=name, action="delete", ok=True, message=msg)
                         if object_type == "policy"
-                        else BatchObjectResult(name=name, action="delete", ok=True, message="镜像删除（源中不存在）")
+                        else BatchObjectResult(name=name, action="delete", ok=True, message="删除（源中不存在）")
                     )
                     continue
                 if object_type == "policy" and usage_error:
@@ -682,7 +708,7 @@ def batch_sync(
                 if usage_by_name.get(name, 0) > 0:
                     details.append(BatchObjectResult(
                         name=name, action="skip", ok=True,
-                        message=f"在用（{usage_by_name[name]} 个用户引用），已跳过镜像删除",
+                        message=f"在用（{usage_by_name[name]} 个用户引用），已跳过删除",
                     ))
                     continue
                 try:
@@ -691,7 +717,7 @@ def batch_sync(
                     invalidate_instance(tid)
                     deleted.append(name)
                     details.append(
-                        BatchObjectResult(name=name, action="delete", ok=True, message="镜像删除（源中不存在）")
+                        BatchObjectResult(name=name, action="delete", ok=True, message="删除（源中不存在）")
                     )
                     # 每个被删对象单独落一条审计并带删前快照，误删后可按快照内容重建
                     audit.record(
@@ -702,7 +728,7 @@ def batch_sync(
                         object_name=name,
                         instance_id=tid,
                         instance_name=target_inst.name,
-                        message=f"镜像删除（{source_inst.name} 中不存在）",
+                        message=f"{'镜像' if mirror else '选择性'}删除（{source_inst.name} 中不存在）",
                         before=before,
                         after=None,
                     )
@@ -727,7 +753,7 @@ def batch_sync(
             message=f"批量同步 {object_type}：{source_inst.name} → {target_inst.name}"
             + f"（新增 {len(created)}/覆盖 {len(updated)}/删除 {len(deleted)}/失败 {len(failed)}）"
             + ("（dry-run）" if dry_run else "")
-            + ("（镜像）" if mirror else ""),
+            + ("（镜像）" if mirror else "（含删除）" if delete_names else ""),
             before=None,
             after=None,
         )

@@ -38,11 +38,15 @@ def build_app_index(tree: dict) -> dict[str, dict]:
     ``crc`` / ``type``。同一 key 多次出现时以**首次**为准（树中路径应唯一）。供按引用
     路径 O(1) 查目标 crc。
 
-    **URL 库能力子类**（``type=power``，即库节点下的 网站浏览/文件上传/其他上传/HTTPS）
-    的 ``value`` 为 null、自身不带完整路径——策略详情里的能力级引用却是三段式
-    ``访问网站/<库名>/<能力名>``。故对这类节点用「父节点 value + ``/`` + 子节点 name」
-    合成 key 登记（crc 用子节点自己的，如 ``<父crc>_5``）；否则能力级引用在**任何**目标
-    上都查不到、被误判为「目标缺失」而拒绝同步。
+    策略引用路径按**名字**拼成（app=``<父分类名>/<自身名>``、power 能力子类=
+    ``<父app路径>/<能力名>``、分类整选=``<分类名>/全部``）；设备树里**多数节点自带 ``value``**
+    （就等于上述路径），但部分**内置结构性节点 ``value`` 为 null**（如根「全部」crc=1、内置
+    URL 库「未分类」crc=4 及其能力子类、「已知应用」等），只认 ``value`` 会漏掉它们，导致这些
+    引用在**任何**目标上都查不到、被误判「目标缺失」而拒绝同步。
+
+    故这里**为每个节点算出有效路径**：有 ``value`` 用 ``value``；否则按类型和父路径合成——
+    子节点据算出的父路径继续，不再依赖父节点是否恰好带 ``value``。crc 一律用节点**自身**的
+    （如根「全部」→ crc 1、未分类的「文件上传」→ crc ``4_3``）。
     """
     index: dict[str, dict] = {}
 
@@ -53,20 +57,44 @@ def build_app_index(tree: dict) -> dict[str, dict]:
                 "type": "" if node.get("type") is None else str(node.get("type")),
             }
 
-    def walk(nodes, parent_value: str = "") -> None:
+    def node_path(node: dict, parent_name: str, parent_path: str) -> str:
+        """节点的引用路径：优先 value；否则按类型 + 父信息合成。取不到返回 ""（不登记）。"""
+        value = node.get("value")
+        if value:
+            return str(value)
+        name = node.get("name")
+        if not name:
+            return ""
+        vtype = node.get("type")
+        if vtype == "catagory":
+            return f"{name}/全部"  # 分类整选：<分类名>/全部
+        if vtype == "power" and parent_path:
+            return f"{parent_path}/{name}"  # 能力子类：<父app路径>/<能力名>
+        if vtype == "app" and parent_name:
+            return f"{parent_name}/{name}"  # 无 value 的 app（内置库如「未分类」）：<父分类名>/<自身名>
+        return ""
+
+    # 两趟：带 value 的真实节点先登记，value 为 null 的合成路径后补——保证真实节点（有自己的
+    # crc）**优先**于合成路径，避免「分类 X 恰好有个名叫『全部』的子叶」这类碰撞盖掉真实叶子。
+    synthesized: list[tuple[str, dict]] = []
+
+    def walk(nodes, parent_name: str = "", parent_path: str = "") -> None:
         if not isinstance(nodes, list):
             return
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            value = node.get("value")
-            if value:
-                register(str(value), node)
-            elif node.get("type") == "power" and node.get("name") and parent_value:
-                register(f"{parent_value}/{node['name']}", node)
-            walk(node.get("children"), str(value) if value else "")
+            path = node_path(node, parent_name, parent_path)
+            if path:
+                if node.get("value"):
+                    register(path, node)  # 真实 value 节点：立刻登记
+                else:
+                    synthesized.append((path, node))  # 合成路径：延后（不覆盖真实节点）
+            walk(node.get("children"), node.get("name") or "", path)
 
     walk(tree.get("data"))
+    for key, node in synthesized:
+        register(key, node)
     return index
 
 

@@ -939,11 +939,12 @@ def _sample_app_tree():
         "tags": [],
         "data": [
             {
+                # 真实设备形态（据实测）：分类节点**自身带 value**（就等于「<name>/全部」）与 crc。
                 "name": "Web流媒体",
                 "type": "catagory",
-                "children": [
-                    {"name": "全部", "type": "app", "value": "Web流媒体/全部", "crc": "T-1001"},
-                ],
+                "value": "Web流媒体/全部",
+                "crc": "T-1001",
+                "children": [],
             },
             {
                 "name": "自定义",
@@ -953,21 +954,43 @@ def _sample_app_tree():
                 ],
             },
             {
-                "name": "访问网站",
+                # 结构性根分类：value 为 null（如真实设备的根「全部」crc=1）。策略以「<name>/全部」
+                # 整类引用它——需按自身名字合成 key 补齐，否则「全部/全部」在任何目标都查不到。
+                "name": "全部",
                 "type": "catagory",
+                "value": None,
+                "crc": "1",
                 "children": [
                     {
-                        # 真实设备形态（据杭州/深圳 AC 实测）：URL 库节点 type=app 带 value；
-                        # 能力子类 type=power、value 为 **null**（引用路径需按「父 value/子 name」
-                        # 合成）、crc 为「父crc_能力序号」。曾因样例把子类 value 想当然填成完整
-                        # 路径，索引查不到真实设备三段式引用的 bug 未被测试暴露。
-                        "name": "钉钉白名单",
-                        "type": "app",
-                        "value": "访问网站/钉钉白名单",
-                        "crc": "T-3000",
+                        "name": "访问网站",
+                        "type": "catagory",
+                        "value": "访问网站/全部",
+                        "crc": "T-9000",
                         "children": [
-                            {"name": "网站浏览", "type": "power", "value": None, "crc": "T-3000_1", "extra": "url"},
-                            {"name": "HTTPS", "type": "power", "value": None, "crc": "T-3000_5", "extra": "url"},
+                            {
+                                # URL 库节点 type=app 带 value；能力子类 type=power、value 为 null
+                                # （引用路径按「父 value/子 name」合成、crc 为「父crc_能力序号」）。
+                                "name": "钉钉白名单",
+                                "type": "app",
+                                "value": "访问网站/钉钉白名单",
+                                "crc": "T-3000",
+                                "children": [
+                                    {"name": "网站浏览", "type": "power", "value": None, "crc": "T-3000_1", "extra": "url"},
+                                    {"name": "HTTPS", "type": "power", "value": None, "crc": "T-3000_5", "extra": "url"},
+                                ],
+                            },
+                            {
+                                # 内置结构性 URL 库「未分类」：type=app 但 **value 为 null**（如真实
+                                # 设备 crc=4）。其引用路径需按「父分类名/自身名」合成，能力子类再顺延，
+                                # 否则「访问网站/未分类/文件上传」在任何目标都查不到、被误判目标缺失。
+                                "name": "未分类",
+                                "type": "app",
+                                "value": None,
+                                "crc": "T-4",
+                                "children": [
+                                    {"name": "文件上传", "type": "power", "value": None, "crc": "T-4_3", "extra": "url"},
+                                ],
+                            },
                         ],
                     },
                 ],
@@ -977,19 +1000,22 @@ def _sample_app_tree():
 
 
 def test_build_app_index_flattens_tree_with_crc():
-    """app 树展平为 path->{crc,type}，递归收集 children 的叶子。"""
+    """app 树展平为 path->{crc,type}，递归收集 children 的叶子，含 value 为 null 的结构性节点。"""
     from app.services.policy_sync import build_app_index
 
     index = build_app_index(_sample_app_tree())
+    # 带 value 的分类 / 应用节点：直接以 value 为 key
     assert index["Web流媒体/全部"]["crc"] == "T-1001"
     assert index["自定义/钉钉应用"] == {"crc": "T-2002", "type": "app"}
-    # URL 库节点（带 value）与其能力子类（value=null → 按「父 value/子 name」合成 key）
     assert index["访问网站/钉钉白名单"]["crc"] == "T-3000"
+    # URL 库能力子类（value=null → 按「父 value/子 name」合成）
     assert index["访问网站/钉钉白名单/网站浏览"] == {"crc": "T-3000_1", "type": "power"}
     assert index["访问网站/钉钉白名单/HTTPS"]["crc"] == "T-3000_5"
-    # 分类节点无 value 且非 power，不入索引
-    assert "Web流媒体" not in index
-    assert "访问网站" not in index
+    # 结构性根分类「全部」（value=null）→ 合成「全部/全部」，crc 为其自身
+    assert index["全部/全部"]["crc"] == "1"
+    # 内置结构性 URL 库「未分类」（type=app、value=null）→ 合成「访问网站/未分类」及其能力子类
+    assert index["访问网站/未分类"]["crc"] == "T-4"
+    assert index["访问网站/未分类/文件上传"] == {"crc": "T-4_3", "type": "power"}
 
 
 def _source_policy_detail():
@@ -1516,6 +1542,62 @@ def test_batch_sync_object_names_with_mirror_raises(monkeypatch):
             target_instance_ids=[2], push_all=False, mirror=True, dry_run=False,
             object_names=["a"],
         )
+
+
+def test_batch_sync_delete_names_deletes_only_selected_extras(monkeypatch):
+    """选择性删除：只删指定的目标多余对象（d），不碰其它多余对象（c）。"""
+    sync_service, target_web = _setup_batch(monkeypatch, ["a", "b"], ["b", "c", "d"])
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="customrule", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=False, dry_run=False,
+        object_names=[], delete_names=["d"],  # 只删 d，不推任何对象
+    )
+    t = res.targets[0]
+    assert t.created == [] and t.updated == []  # object_names=[] → 一个都不推
+    assert t.deleted == ["d"] and target_web.deleted == ["d"]  # 只删 d，c 保留
+
+
+def test_batch_sync_delete_names_skips_non_extra(monkeypatch):
+    """选择性删除的安全边界：源上也有的名字（b）与目标上没有的名字（z）都跳过记 failed，绝不误删。"""
+    sync_service, target_web = _setup_batch(monkeypatch, ["a", "b"], ["b", "c", "d"])
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="customrule", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=False, dry_run=False,
+        object_names=[], delete_names=["b", "z", "d"],
+    )
+    t = res.targets[0]
+    assert t.deleted == ["d"] and target_web.deleted == ["d"]  # 只有 d 确属目标多余
+    failed = {f.name: f.message for f in t.failed}
+    assert "源实例上也存在" in failed["b"]  # b 源上也有 → 属推送对象，不删
+    assert "目标实例上不存在" in failed["z"]  # z 目标上没有 → 无从删
+
+
+def test_batch_sync_delete_names_with_mirror_raises(monkeypatch):
+    """选择性删除与镜像互斥。"""
+    sync_service, _ = _setup_batch(monkeypatch, ["a"], ["a", "b"])
+    user = type("U", (), {"username": "admin"})()
+    with pytest.raises(ValueError):
+        sync_service.batch_sync(
+            db=None, user=user, object_type="customrule", source_instance_id=1,
+            target_instance_ids=[2], push_all=False, mirror=True, dry_run=False,
+            delete_names=["b"],
+        )
+
+
+def test_batch_sync_push_and_delete_together(monkeypatch):
+    """暂存式应用：一次调用里既推送已选对象（a）又删除已选多余对象（d）。"""
+    sync_service, target_web = _setup_batch(monkeypatch, ["a", "b"], ["b", "d"])
+    user = type("U", (), {"username": "admin"})()
+    res = sync_service.batch_sync(
+        db=None, user=user, object_type="customrule", source_instance_id=1,
+        target_instance_ids=[2], push_all=False, mirror=False, dry_run=False,
+        object_names=["a"], delete_names=["d"],
+    )
+    t = res.targets[0]
+    assert t.created == ["a"]  # 推送 a（目标无 → 新增）
+    assert t.deleted == ["d"] and target_web.deleted == ["d"]  # 删除多余的 d
 
 
 class _PolicyMirrorWeb:
