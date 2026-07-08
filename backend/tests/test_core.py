@@ -1474,6 +1474,39 @@ def _setup_batch(monkeypatch, source_names, target_names):
     return sync_service, target_web
 
 
+def test_content_snapshot_tags_for_audit_render():
+    """规范化快照包成带类型标签的审计内容（前端据 kind=snapshot 用 SnapshotView 渲染）；空则 None。"""
+    from app.services.sync_service import _content_snapshot
+
+    snap = {"policy_name": "P", "rules": [{"action": "deny", "apps": [], "urls": []}]}
+    out = _content_snapshot("policy", snap)
+    assert out == {"kind": "snapshot", "object_type": "policy", "data": snap}
+    assert _content_snapshot("policy", None) is None
+    assert _content_snapshot("url", {}) is None  # 空快照不生成内容
+
+
+def test_readable_batch_summary_groups_by_action():
+    """批量结果整理成按动作分组的可读摘要（供审计详情，胜过 null/原始报文）。"""
+    from app.schemas.sync import BatchObjectResult
+    from app.services.sync_service import _readable_batch_summary
+
+    details = [
+        BatchObjectResult(name="A", action="update", ok=True, message=""),
+        BatchObjectResult(name="B", action="update", ok=True, message="降级：跳过 2 个引用"),
+        BatchObjectResult(name="C", action="create", ok=True, message=""),
+        BatchObjectResult(name="X", action="delete", ok=True, message="删除（源中不存在）"),
+        BatchObjectResult(name="D", action="skip", ok=True, message="在用，已跳过"),
+    ]
+    failed = [BatchObjectResult(name="E", action="fail", ok=False, message="写入失败")]
+    out = _readable_batch_summary(details, failed)
+    assert out["新增"] == ["C"]  # 无说明只存对象名
+    assert out["覆盖"] == ["A", {"对象": "B", "说明": "降级：跳过 2 个引用"}]  # 有说明存 {对象,说明}
+    assert out["删除"] == [{"对象": "X", "说明": "删除（源中不存在）"}]
+    assert out["跳过"] == [{"对象": "D", "说明": "在用，已跳过"}]
+    assert out["失败"] == [{"对象": "E", "说明": "写入失败"}]
+    assert _readable_batch_summary([], []) == {}  # 空则空 dict（调用方写 None）
+
+
 def test_batch_sync_upsert_splits_create_and_update(monkeypatch):
     """源有目标无 → 新增；两边都有 → 更新；不开镜像不删除。"""
     sync_service, target_web = _setup_batch(monkeypatch, ["a", "b", "c"], ["b", "c", "d"])

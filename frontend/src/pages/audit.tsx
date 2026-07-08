@@ -4,6 +4,7 @@ import { Search } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { CenteredSpinner, JsonView, PageHeader } from "@/components/common";
+import { SnapshotView } from "@/components/sync/snapshot";
 import { DataTable } from "@/components/data-table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -12,7 +13,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { auditApi } from "@/lib/api";
-import type { AuditLog } from "@/lib/types";
+import type { AuditLog, ObjectType } from "@/lib/types";
 
 const OBJECT_TYPES = ["", "instance", "customrule", "url", "policy", "sync"];
 const ACTIONS = ["", "create", "update", "delete", "sync", "dry_run"];
@@ -24,6 +25,30 @@ function safeParse(text: string) {
   } catch {
     return text;
   }
+}
+
+/**
+ * 审计「变更前/后」的一侧渲染：同步单对象时后端存的是带类型标签的规范化快照
+ * （`{kind:"snapshot", object_type, data}`）——用对比页同款 SnapshotView 渲染成可读内容
+ * （策略规则/引用、端口/代理控制，URL 列表，自定义应用 IP/域名）；其余（批量分组摘要、
+ * 删除原始详情、旧记录报文等）回退到 JsonView 树。
+ */
+function AuditSide({ raw }: { raw: string }) {
+  const parsed = safeParse(raw);
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    (parsed as any).kind === "snapshot" &&
+    (parsed as any).data
+  ) {
+    const snap = parsed as { object_type: ObjectType; data: Record<string, unknown> };
+    return (
+      <div className="rounded-md border border-border/50 p-2.5">
+        <SnapshotView data={snap.data} objectType={snap.object_type} />
+      </div>
+    );
+  }
+  return <JsonView data={parsed} />;
 }
 
 export function AuditPage() {
@@ -228,11 +253,11 @@ export function AuditPage() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <div className="mb-1 text-xs font-medium text-muted-foreground">变更前</div>
-              <JsonView data={safeParse(detail?.before ?? "")} />
+              <AuditSide raw={detail?.before ?? ""} />
             </div>
             <div>
               <div className="mb-1 text-xs font-medium text-muted-foreground">变更后 / 报文</div>
-              <JsonView data={safeParse(detail?.after ?? "")} />
+              <AuditSide raw={detail?.after ?? ""} />
             </div>
           </div>
         </DialogContent>

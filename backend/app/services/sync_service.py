@@ -340,7 +340,7 @@ def apply_sync(
             continue
         try:
             web = session_pool.get_web_client(target_inst)
-            status, _, err = _build_snapshot(web, object_type, object_name)
+            status, target_prior, err = _build_snapshot(web, object_type, object_name)
             if status == "error":
                 # 读取目标失败时禁止写入：否则可能把「读失败」误当作「不存在」而错误新增
                 results.append(
@@ -420,8 +420,10 @@ def apply_sync(
                 + ("（dry-run）" if (dry_run or outcome.get("dry_run")) else "")
                 + note
                 + ("；".join([""] + details) if details else ""),
-                before=None,
-                after=outcome.get("payload") or outcome.get("result"),
+                # 变更前：目标原内容（仅更新时有，新增则无）；变更后：拟同步的源内容。
+                # 两侧均为规范化快照（带类型标签），前端用对比页同款 SnapshotView 渲染成可读内容。
+                before=_content_snapshot(object_type, target_prior) if exists else None,
+                after=_content_snapshot(object_type, source_snapshot),
             )
         except Exception as exc:  # noqa: BLE001
             results.append(
@@ -476,6 +478,38 @@ def _read_before_delete(web: SangforWebClient, object_type: str, name: str) -> d
         return web.get_policy_detail(name)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _content_snapshot(object_type: str, snapshot: dict | None) -> dict | None:
+    """把规范化对象快照包成带类型标签的审计内容。
+
+    前端审计详情识别 ``kind == "snapshot"`` 后，用与对比页相同的组件（SnapshotView）渲染出
+    可读内容（策略的规则 + 引用应用/URL、端口/代理控制；URL 库的 URL 列表；自定义应用的
+    IP/域名等），而非原始 CGI 报文或设备回执。快照为空返回 None。
+    """
+    if not snapshot:
+        return None
+    return {"kind": "snapshot", "object_type": object_type, "data": snapshot}
+
+
+# 批量逐对象动作 -> 审计摘要里的中文分组名
+_BATCH_ACTION_LABEL = {"create": "新增", "update": "覆盖", "delete": "删除", "skip": "跳过", "fail": "失败"}
+
+
+def _readable_batch_summary(
+    details: list[BatchObjectResult], failed: list[BatchObjectResult]
+) -> dict[str, list]:
+    """把批量逐对象结果整理成「按动作分组、带对象名与说明」的可读摘要。
+
+    供审计详情展示——比一条汇总消息或原始 CGI 报文直观：能一眼看出这批同步里哪些对象被
+    新增 / 覆盖 / 删除 / 跳过 / 失败及各自原因。无说明的条目只存对象名，有说明的存
+    ``{对象, 说明}``。空则返回 ``{}``（调用方据此写 None）。
+    """
+    grouped: dict[str, list] = {}
+    for r in [*details, *failed]:
+        label = _BATCH_ACTION_LABEL.get(r.action, r.action)
+        grouped.setdefault(label, []).append({"对象": r.name, "说明": r.message} if r.message else r.name)
+    return grouped
 
 
 def batch_sync(
@@ -592,6 +626,7 @@ def batch_sync(
         created: list[str] = []
         updated: list[str] = []
         deleted: list[str] = []
+        deleted_snapshots: list[dict] = []  # 被删对象的删前内容，进审计「变更前」供核对/重建
         failed: list[BatchObjectResult] = [
             BatchObjectResult(
                 name=n, action="fail", ok=False,
@@ -716,6 +751,8 @@ def batch_sync(
                     _delete_from_target(web, object_type, name, dry_run)
                     invalidate_instance(tid)
                     deleted.append(name)
+                    if before is not None:
+                        deleted_snapshots.append({"对象": name, "删除前内容": before})
                     details.append(
                         BatchObjectResult(name=name, action="delete", ok=True, message="删除（源中不存在）")
                     )
@@ -754,8 +791,10 @@ def batch_sync(
             + f"（新增 {len(created)}/覆盖 {len(updated)}/删除 {len(deleted)}/失败 {len(failed)}）"
             + ("（dry-run）" if dry_run else "")
             + ("（镜像）" if mirror else "（含删除）" if delete_names else ""),
-            before=None,
-            after=None,
+            # 变更前：被删对象的删前内容（可核对/重建）；变更后：按动作分组的可读摘要
+            # （新增/覆盖/删除/跳过/失败 + 对象名与原因），比原始报文直观。
+            before={"删除的对象": deleted_snapshots} if deleted_snapshots else None,
+            after=_readable_batch_summary(details, failed) or None,
         )
 
     return BatchSyncResult(
