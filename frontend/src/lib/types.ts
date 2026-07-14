@@ -365,6 +365,37 @@ export interface BatchCompareResult {
   targets: CompareTargetResult[];
 }
 
+// ---- 跨实例合并（并集）：自定义应用 / URL 库 ----
+export interface MergeTargetResult {
+  instance_id: number;
+  instance_name: string;
+  action: "create" | "update" | "skip" | "fail";
+  ok: boolean;
+  message: string;
+}
+
+export interface MergePreviewField {
+  field: string;
+  label: string;
+  /** 两端共有 / 仅源侧有 / 仅目标侧有的条目。 */
+  both: string[];
+  only_source: string[];
+  only_target: string[];
+}
+
+export interface MergeResult {
+  object_type: "customrule" | "url";
+  object_name: string;
+  dry_run: boolean;
+  /** 冲突：自定义应用模式/标量字段两端不一致，未写入。 */
+  conflict: boolean;
+  conflict_fields: string[];
+  merged_snapshot: Record<string, unknown> | null;
+  /** 并集内容按来源分类（供预览高亮）。 */
+  preview_fields: MergePreviewField[];
+  targets: MergeTargetResult[];
+}
+
 // ---- 全局搜索 ----
 export interface SearchHit {
   name: string;

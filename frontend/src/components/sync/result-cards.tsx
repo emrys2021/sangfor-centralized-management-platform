@@ -4,10 +4,12 @@ import { AlertTriangle, ArrowRight, ChevronDown, ChevronRight, Trash2 } from "lu
 import { useEffect, useMemo, useState } from "react";
 
 import { JsonView } from "@/components/common";
+import { hasMergeableDiff } from "@/components/sync/field-diff";
 import { ObjectDiffBody } from "@/components/sync/object-diff";
 import { SnapshotView } from "@/components/sync/snapshot";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
 import type {
   BatchTargetResult,
   CompareItem,
@@ -149,15 +151,15 @@ export function BatchResultCard({ t, objectType }: { t: BatchTargetResult; objec
       {!t.error && (
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
           <span>新增 <span className="text-emerald-400">{t.created.length}</span></span>
-          <span title="目标已存在同名，写入源内容覆盖（未逐项比对内容差异）">
-            覆盖 <span className="text-sky-400">{t.updated.length}</span>
-          </span>
+          <Tooltip content="目标已存在同名，写入源内容覆盖（未逐项比对内容差异）">
+            <span>覆盖 <span className="text-sky-400">{t.updated.length}</span></span>
+          </Tooltip>
           <span>删除 <span className="text-red-400">{t.deleted.length}</span></span>
           <span>失败 <span className="text-amber-400">{t.failed.length}</span></span>
           {skipped.length > 0 && (
-            <span title="保护性跳过：如镜像删除时策略仍被用户引用，不删除">
-              跳过 <span className="text-sky-300">{skipped.length}</span>
-            </span>
+            <Tooltip content="保护性跳过：如镜像删除时策略仍被用户引用，不删除">
+              <span>跳过 <span className="text-sky-300">{skipped.length}</span></span>
+            </Tooltip>
           )}
         </div>
       )}
@@ -224,11 +226,13 @@ function CompareItemRow({
   objectType,
   checked,
   onToggle,
+  onMerge,
 }: {
   item: CompareItem;
   objectType: ObjectType;
   checked: boolean;
   onToggle?: () => void;
+  onMerge?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const expandable =
@@ -240,13 +244,17 @@ function CompareItemRow({
     <div className="rounded border border-border/40">
       <div className="flex w-full items-center gap-2 px-2.5 py-1.5 text-xs">
         {selectable ? (
-          <input
-            type="checkbox"
-            checked={checked}
-            onChange={onToggle}
-            className={`h-3.5 w-3.5 shrink-0 ${item.status === "target_only" ? "accent-red-500" : "accent-primary"}`}
-            title={item.status === "target_only" ? "勾选后可删除（源上没有）" : "勾选后可同步到目标"}
-          />
+          <Tooltip
+            align="start"
+            content={item.status === "target_only" ? "勾选后可删除（源上没有）" : "勾选后可同步到目标"}
+          >
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={onToggle}
+              className={`h-3.5 w-3.5 shrink-0 ${item.status === "target_only" ? "accent-red-500" : "accent-primary"}`}
+            />
+          </Tooltip>
         ) : (
           <span className="w-3.5 shrink-0" />
         )}
@@ -265,6 +273,20 @@ function CompareItemRow({
           </span>
           {item.status === "error" && item.error && <span className="text-red-400/80">— {item.error}</span>}
         </button>
+        {/* 合并两端：仅「内容不一致」且**差异含可合并列表字段**的自定义应用/URL 库——把两端列表
+            内容求并集写回两端，解决「各加了条 IP、单向同步会互相覆盖」的场景。策略不支持合并；
+            仅启用状态/描述不同（无列表差异）时不显示——合并帮不上。 */}
+        {onMerge && item.status === "different" && objectType !== "policy" && hasMergeableDiff(item.diffs) && (
+          <Tooltip align="end" content="把源与该目标的列表内容（IP/URL/域名/关键词）求并集写回两端；启用状态、描述各端保持不变">
+            <button
+              type="button"
+              onClick={onMerge}
+              className="shrink-0 rounded border border-violet-500/40 px-1.5 py-0.5 text-[11px] text-violet-300/90 transition-colors hover:bg-violet-500/10"
+            >
+              合并两端
+            </button>
+          </Tooltip>
+        )}
       </div>
       {open && expandable && (
         <div className="border-t border-border/40 px-2.5 py-2">
@@ -295,6 +317,7 @@ function CompareGroup({
   selectedNames,
   onToggleItem,
   onToggleGroup,
+  onMerge,
 }: {
   status: CompareStatus;
   items: CompareItem[];
@@ -303,6 +326,7 @@ function CompareGroup({
   selectedNames?: Set<string>;
   onToggleItem?: (name: string) => void;
   onToggleGroup?: (names: string[], select: boolean) => void;
+  onMerge?: (name: string) => void;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   if (items.length === 0) return null;
@@ -314,14 +338,15 @@ function CompareGroup({
     <div className="space-y-1">
       <div className="flex items-center gap-1.5">
         {selectable ? (
-          <input
-            type="checkbox"
-            checked={allSel}
-            ref={(el) => el && (el.indeterminate = selCount > 0 && !allSel)}
-            onChange={() => onToggleGroup!(items.map((i) => i.name), !allSel)}
-            className={`h-3.5 w-3.5 shrink-0 ${status === "target_only" ? "accent-red-500" : "accent-primary"}`}
-            title={status === "target_only" ? "全选本组以删除" : "全选本组以同步"}
-          />
+          <Tooltip align="start" content={status === "target_only" ? "全选本组以删除" : "全选本组以同步"}>
+            <input
+              type="checkbox"
+              checked={allSel}
+              ref={(el) => el && (el.indeterminate = selCount > 0 && !allSel)}
+              onChange={() => onToggleGroup!(items.map((i) => i.name), !allSel)}
+              className={`h-3.5 w-3.5 shrink-0 ${status === "target_only" ? "accent-red-500" : "accent-primary"}`}
+            />
+          </Tooltip>
         ) : (
           <span className="w-3.5 shrink-0" />
         )}
@@ -344,6 +369,7 @@ function CompareGroup({
               objectType={objectType}
               checked={!!selectedNames?.has(it.name)}
               onToggle={onToggleItem ? () => onToggleItem(it.name) : undefined}
+              onMerge={onMerge ? () => onMerge(it.name) : undefined}
             />
           ))}
         </div>
@@ -358,6 +384,7 @@ export function CompareResultCard({
   namesOnly,
   onSync,
   onDelete,
+  onMerge,
   busy = false,
 }: {
   t: CompareTargetResult;
@@ -366,6 +393,8 @@ export function CompareResultCard({
   // 勾选后「同步选中/删除选中」的回调；不传则卡片为纯只读（无勾选框）。
   onSync?: (instanceId: number, instanceName: string, names: string[]) => void;
   onDelete?: (instanceId: number, instanceName: string, names: string[]) => void;
+  // 「合并两端」回调（源 ↔ 该目标求并集写回两端）；仅对内容对比的自定义应用/URL 传入。
+  onMerge?: (instanceId: number, instanceName: string, name: string) => void;
   busy?: boolean;
 }) {
   // 仅名单：源/目标/都有三桶；内容：不一致/仅源/仅目标/一致四桶。
@@ -455,6 +484,7 @@ export function CompareResultCard({
                 selectedNames={selectable ? selected : undefined}
                 onToggleItem={selectable ? toggleItem : undefined}
                 onToggleGroup={selectable ? toggleGroup : undefined}
+                onMerge={onMerge ? (name) => onMerge(t.instance_id, t.instance_name, name) : undefined}
               />
             ))}
           </div>

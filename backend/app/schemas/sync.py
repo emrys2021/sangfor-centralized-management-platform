@@ -179,6 +179,45 @@ class CompareTargetResult(BaseModel):
     items: list[CompareItem] = []
 
 
+class MergeRequest(BaseModel):
+    # 合并仅支持自定义应用 / URL 库（策略不支持，见 merge_service）
+    object_type: Literal["customrule", "url"]
+    object_name: str
+    instance_ids: list[int] = []  # 参与合并的实例（≥2）；并集会写回其中所有实例
+    dry_run: bool = True
+
+
+class MergeTargetResult(BaseModel):
+    instance_id: int
+    instance_name: str
+    action: Literal["create", "update", "skip", "fail"]
+    ok: bool = True
+    message: str = ""
+
+
+class MergePreviewField(BaseModel):
+    """并集里某个列表字段按来源的分类，供预览高亮。"""
+
+    field: str
+    label: str
+    both: list[str] = []  # 两端共有
+    only_source: list[str] = []  # 仅源侧有（instance_ids[0]）
+    only_target: list[str] = []  # 仅目标侧有（其余实例）
+
+
+class MergeResult(BaseModel):
+    object_type: Literal["customrule", "url"]
+    object_name: str
+    dry_run: bool
+    # 冲突：自定义应用的模式/标量字段两端不一致，无法并集——不写任何实例
+    conflict: bool = False
+    conflict_fields: list[str] = []
+    merged_snapshot: dict | None = None  # 并集后的规范化内容（冲突时为 None）
+    # 并集内容按来源分类（两端共有 / 源独有 / 目标独有），供预览高亮
+    preview_fields: list[MergePreviewField] = []
+    targets: list[MergeTargetResult] = []
+
+
 class BatchCompareResult(BaseModel):
     object_type: ObjectType
     source_instance_id: int

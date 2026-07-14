@@ -975,8 +975,10 @@ def _sample_app_tree():
                                 "value": "访问网站/钉钉白名单",
                                 "crc": "T-3000",
                                 "children": [
-                                    {"name": "网站浏览", "type": "power", "value": None, "crc": "T-3000_1", "extra": "url"},
-                                    {"name": "HTTPS", "type": "power", "value": None, "crc": "T-3000_5", "extra": "url"},
+                                    {"name": "网站浏览", "type": "power", "value": None,
+                                     "crc": "T-3000_1", "extra": "url"},
+                                    {"name": "HTTPS", "type": "power", "value": None,
+                                     "crc": "T-3000_5", "extra": "url"},
                                 ],
                             },
                             {
@@ -988,7 +990,8 @@ def _sample_app_tree():
                                 "value": None,
                                 "crc": "T-4",
                                 "children": [
-                                    {"name": "文件上传", "type": "power", "value": None, "crc": "T-4_3", "extra": "url"},
+                                    {"name": "文件上传", "type": "power", "value": None,
+                                     "crc": "T-4_3", "extra": "url"},
                                 ],
                             },
                         ],
@@ -1483,6 +1486,36 @@ def test_content_snapshot_tags_for_audit_render():
     assert out == {"kind": "snapshot", "object_type": "policy", "data": snap}
     assert _content_snapshot("policy", None) is None
     assert _content_snapshot("url", {}) is None  # 空快照不生成内容
+
+
+def test_batch_after_content_small_vs_large():
+    """小批量（≤上限）逐条带源内容快照（kind=snapshots）；大批量退回按动作分组名单摘要。"""
+    from app.schemas.sync import BatchObjectResult
+    from app.services import sync_service
+    from app.services.sync_service import _batch_after_content
+
+    snap = {"policy_name": "P", "rules": []}
+    # 小批量：2 条有内容 + 1 条失败（无内容，附说明）
+    synced = [
+        {"name": "A", "action": "新增", "data": snap, "note": ""},
+        {"name": "B", "action": "覆盖", "data": snap, "note": "降级：跳过 1 个引用"},
+    ]
+    details = [
+        BatchObjectResult(name="A", action="create", ok=True),
+        BatchObjectResult(name="B", action="update", ok=True, message="降级：跳过 1 个引用"),
+    ]
+    failed = [BatchObjectResult(name="C", action="fail", ok=False, message="写入失败")]
+    out = _batch_after_content("policy", synced, details, failed)
+    assert out["kind"] == "snapshots" and out["object_type"] == "policy"
+    assert [it["name"] for it in out["items"]] == ["A", "B", "C"]  # 内容项 + 失败说明项
+    assert out["items"][0]["data"] == snap and "data" not in out["items"][2]  # 失败项无内容
+
+    # 大批量：超上限 → 退回名单摘要（无 kind、按中文动作分组）
+    n = sync_service._BATCH_CONTENT_MAX + 1
+    big_synced = [{"name": f"P{i}", "action": "覆盖", "data": snap, "note": ""} for i in range(n)]
+    big_details = [BatchObjectResult(name=f"P{i}", action="update", ok=True) for i in range(n)]
+    out2 = _batch_after_content("policy", big_synced, big_details, [])
+    assert "kind" not in out2 and "覆盖" in out2  # 名单摘要形态
 
 
 def test_readable_batch_summary_groups_by_action():
@@ -2238,3 +2271,218 @@ def test_analyze_policy_usage_expands_inherited_group_strategy(monkeypatch):
     assert by_name["真没人用"]["used"] is False
     assert out["unused_count"] == 1 and out["total_users"] == 1
 
+
+
+# --------------------------------------------------------------------------- #
+# 跨实例合并（并集）：自定义应用 / URL 库
+# --------------------------------------------------------------------------- #
+
+def test_union_lines_ordered_dedupe():
+    """并集：有序去重、保留先出现者、换行拼接。"""
+    from app.services.merge_service import union_lines
+
+    assert union_lines("1.1.1.1\n2.2.2.2", "2.2.2.2\n3.3.3.3") == "1.1.1.1\n2.2.2.2\n3.3.3.3"
+    assert union_lines(" a \n\n b ", "b\nc") == "a\nb\nc"  # 去空行/首尾空白
+    assert union_lines("", "") == ""
+
+
+def test_union_list_fields_only_merges_lists():
+    """并集只覆盖列表字段（url/keyword 或 ip_range/domain），不含 status/depict 等专属字段。"""
+    from app.services.merge_service import union_list_fields
+
+    a = {"name": "foo", "depict": "", "url": "a.com\n1.1.1.1", "keyword": "k1", "status": True}
+    b = {"name": "foo", "depict": "说明B", "url": "1.1.1.1\nb.com", "keyword": "k2", "status": False}
+    fields = union_list_fields("url", [a, b])
+    assert set(fields) == {"url", "keyword"}  # 只有列表字段
+    assert fields["url"] == "a.com\n1.1.1.1\nb.com"  # 去重并集
+    assert fields["keyword"] == "k1\nk2"
+
+
+def test_customrule_conflicts_excludes_status_and_depict():
+    """自定义应用冲突字段：模式/标量不一致算冲突；status/depict 两端不同**不算**冲突（各端保留）。"""
+    from app.services.merge_service import customrule_conflicts
+
+    base = {"rulename": "app", "apptype": "t", "appname": "n", "direction": "both",
+            "protocol": "6", "protocol_num": "", "port_mode": "all", "port_range": "",
+            "ip_mode": "specified", "domain": "", "ip_range": "1.1.1.1"}
+    # 仅 status / depict 不同 → 无冲突（可合并、各端保留启用状态与描述）
+    assert customrule_conflicts([base, {**base, "status": False, "depict": "x"}]) == []
+    # 模式/标量不同 → 冲突
+    assert set(customrule_conflicts([base, {**base, "protocol": "17", "direction": "lan2wan"}])) == {
+        "protocol", "direction",
+    }
+
+
+class _MergeWeb:
+    """合并测试替身：按名单持有 URL 库内容，记录写入。"""
+
+    def __init__(self, url_by_name):
+        self._url = dict(url_by_name)  # name -> url_text
+        self.updated: list[dict] = []
+        self.created: list[dict] = []
+
+    def get_url_group_detail(self, name):
+        return {"id": "1", "name": name, "depict": "", "url": [], "url_text": self._url.get(name, ""),
+                "keyword": ""}
+
+    def update_url_group(self, data, *, dry_run=True):
+        self.updated.append(data)
+        return {"dry_run": dry_run}
+
+    def create_url_group(self, data, *, dry_run=True):
+        self.created.append(data)
+        return {"dry_run": dry_run}
+
+
+def _setup_merge(monkeypatch, webs):
+    from app.services import merge_service
+
+    class _Inst:
+        def __init__(self, i): self.id, self.name = i, f"AC{i}"
+    insts = {i: _Inst(i) for i in webs}
+    monkeypatch.setattr(merge_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    monkeypatch.setattr(merge_service.session_pool, "get_web_client", lambda inst: webs[inst.id])
+    monkeypatch.setattr(merge_service.sync_service, "invalidate_instance", lambda i: None)
+    monkeypatch.setattr(merge_service.audit, "record", lambda *a, **k: None)
+    return merge_service
+
+
+def test_merge_object_writes_union_to_all_instances(monkeypatch):
+    """两端各有独有 IP → 并集写回**两端**，两端最终一致。"""
+    a = _MergeWeb({"foo": "1.1.1.1\n2.2.2.2"})  # A 独有 2.2.2.2
+    b = _MergeWeb({"foo": "1.1.1.1\n3.3.3.3"})  # B 独有 3.3.3.3
+    merge_service = _setup_merge(monkeypatch, {1: a, 2: b})
+    user = type("U", (), {"username": "admin"})()
+    res = merge_service.merge_object(db=None, user=user, object_type="url", object_name="foo",
+                                     instance_ids=[1, 2], dry_run=False)
+    assert res.conflict is False
+    assert res.merged_snapshot["url"] == "1.1.1.1\n2.2.2.2\n3.3.3.3"
+    assert {t.instance_id: t.action for t in res.targets} == {1: "update", 2: "update"}
+    # 两端都被写成并集
+    assert a.updated[0]["url"] == "1.1.1.1\n2.2.2.2\n3.3.3.3"
+    assert b.updated[0]["url"] == "1.1.1.1\n2.2.2.2\n3.3.3.3"
+
+
+def test_merge_object_rejects_below_two_instances(monkeypatch):
+    """少于两个实例都存在该对象时拒绝合并（应走普通同步）。"""
+    a = _MergeWeb({"foo": "1.1.1.1"})
+    b = _MergeWeb({})  # B 没有 foo
+    merge_service = _setup_merge(monkeypatch, {1: a, 2: b})
+    # B 读不到 foo → not_found；只有 1 端 found → 拒绝
+    monkeypatch.setattr(
+        merge_service.sync_service, "_build_snapshot",
+        lambda web, ot, name: (
+            ("found", {"name": name, "depict": "", "url": web._url[name], "keyword": ""}, "")
+            if name in web._url else ("not_found", {}, "")
+        ),
+    )
+    user = type("U", (), {"username": "admin"})()
+    with pytest.raises(ValueError):
+        merge_service.merge_object(db=None, user=user, object_type="url", object_name="foo",
+                                   instance_ids=[1, 2], dry_run=False)
+
+
+def test_preview_fields_classifies_origin():
+    """并集预览按来源分类：两端共有 / 源独有 / 目标独有。"""
+    from app.services.merge_service import _preview_fields
+
+    src = {"url": "a.com\n1.1.1.1\n2.2.2.2", "keyword": "k1"}  # 源独有 a.com、2.2.2.2
+    tgt = {"url": "1.1.1.1\n3.3.3.3", "keyword": "k1\nk2"}  # 目标独有 3.3.3.3、k2
+    fields = {f.field: f for f in _preview_fields("url", [src, tgt])}
+    u = fields["url"]
+    assert u.both == ["1.1.1.1"]
+    assert u.only_source == ["a.com", "2.2.2.2"]
+    assert u.only_target == ["3.3.3.3"]
+    kw = fields["keyword"]
+    assert kw.both == ["k1"] and kw.only_target == ["k2"] and kw.only_source == []
+
+
+def test_merge_object_skips_instance_already_equal_union(monkeypatch):
+    """一端本就是并集（另一端的超集）→ 该端跳过、不写；另一端补齐。"""
+    a = _MergeWeb({"foo": "1.1.1.1\n2.2.2.2"})  # A 已是超集 = 并集
+    b = _MergeWeb({"foo": "1.1.1.1"})  # B 缺 2.2.2.2
+    merge_service = _setup_merge(monkeypatch, {1: a, 2: b})
+    user = type("U", (), {"username": "admin"})()
+    res = merge_service.merge_object(db=None, user=user, object_type="url", object_name="foo",
+                                     instance_ids=[1, 2], dry_run=False)
+    by = {t.instance_id: t for t in res.targets}
+    assert by[1].action == "skip" and "已是并集" in by[1].message  # A 无需写
+    assert by[2].action == "update"  # B 补齐
+    assert a.updated == []  # A 确实没被写
+    assert b.updated[0]["url"] == "1.1.1.1\n2.2.2.2"
+
+
+def test_merge_object_preserves_per_instance_status_and_depict(monkeypatch):
+    """Issue1：合并只并列表，启用状态 / 描述各端保留——不被源端静默覆盖。"""
+    from app.services import merge_service
+
+    # 深圳=启用/描述深圳，杭州=禁用/描述杭州；管理员只想并 IP
+    snaps = {
+        1: {"rulename": "app", "status": True, "depict": "深圳", "apptype": "t", "appname": "n",
+            "direction": "both", "protocol": "6", "protocol_num": "", "port_mode": "all",
+            "port_range": "", "ip_mode": "specified", "domain": "", "ip_range": "1.1.1.1\n2.2.2.2"},
+        2: {"rulename": "app", "status": False, "depict": "杭州", "apptype": "t", "appname": "n",
+            "direction": "both", "protocol": "6", "protocol_num": "", "port_mode": "all",
+            "port_range": "", "ip_mode": "specified", "domain": "", "ip_range": "1.1.1.1\n3.3.3.3"},
+    }
+
+    class Web:
+        def __init__(self, iid):
+            self.iid, self.written = iid, []
+
+        def update_custom_rule(self, data, *, dry_run=True):
+            self.written.append(data)
+            return {"dry_run": dry_run}
+
+        def create_custom_rule(self, data, *, dry_run=True):
+            self.written.append(data)
+            return {"dry_run": dry_run}
+
+    webs = {1: Web(1), 2: Web(2)}
+
+    class _Inst:
+        def __init__(self, i): self.id, self.name = i, f"AC{i}"
+    insts = {i: _Inst(i) for i in webs}
+    monkeypatch.setattr(merge_service.instance_service, "get_instance", lambda db, i: insts.get(i))
+    monkeypatch.setattr(merge_service.session_pool, "get_web_client", lambda inst: webs[inst.id])
+    monkeypatch.setattr(merge_service.sync_service, "invalidate_instance", lambda i: None)
+    monkeypatch.setattr(merge_service.audit, "record", lambda *a, **k: None)
+    monkeypatch.setattr(merge_service.sync_service, "_build_snapshot",
+                        lambda web, ot, name: ("found", dict(snaps[web.iid]), ""))
+
+    user = type("U", (), {"username": "admin"})()
+    res = merge_service.merge_object(db=None, user=user, object_type="customrule", object_name="app",
+                                     instance_ids=[1, 2], dry_run=False)
+    assert res.conflict is False
+    union = "1.1.1.1\n2.2.2.2\n3.3.3.3"
+    # 两端 ip_range 都并成并集
+    assert webs[1].written[0]["packet"]["specified_ip"]["ip_range"] == union
+    assert webs[2].written[0]["packet"]["specified_ip"]["ip_range"] == union
+    # 启用状态 / 描述各端保留自身值（未被源端覆盖）
+    assert webs[1].written[0]["enable"] is True and webs[1].written[0]["basic"]["depict"] == "深圳"
+    assert webs[2].written[0]["enable"] is False and webs[2].written[0]["basic"]["depict"] == "杭州"
+
+
+def test_merge_object_order_only_diff_skips_both(monkeypatch):
+    """列表语义是集合、顺序无意义：两端同集合仅顺序不同 → 两端都跳过、不做无谓重写。"""
+    a = _MergeWeb({"foo": "a\nb"})
+    b = _MergeWeb({"foo": "b\na"})  # 同集合、顺序不同
+    merge_service = _setup_merge(monkeypatch, {1: a, 2: b})
+    user = type("U", (), {"username": "admin"})()
+    res = merge_service.merge_object(db=None, user=user, object_type="url", object_name="foo",
+                                     instance_ids=[1, 2], dry_run=False)
+    assert {t.instance_id: t.action for t in res.targets} == {1: "skip", 2: "skip"}
+    assert a.updated == [] and b.updated == []  # 顺序不同不重写
+
+
+def test_diff_snapshots_list_fields_order_insensitive():
+    """对比：自定义应用/URL 的列表字段按集合比——仅顺序不同不算差异；真的多/少条目才算。"""
+    from app.services.sync_service import _diff_snapshots
+
+    # 仅顺序不同 → 无差异
+    assert _diff_snapshots({"url": "a\nb"}, {"url": "b\na"}) == []
+    assert _diff_snapshots({"ip_range": "1.1.1.1\n2.2.2.2"}, {"ip_range": "2.2.2.2\n1.1.1.1"}) == []
+    # 真的多一条 → 有差异
+    assert [d.field for d in _diff_snapshots({"url": "a\nb"}, {"url": "a"})] == ["url"]
+    # 非列表字段仍按值比（如启用状态）
+    assert [d.field for d in _diff_snapshots({"status": True}, {"status": False})] == ["status"]

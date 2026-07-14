@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import type { RefState } from "@/components/sync/policy-rules";
+import type { FieldDiff } from "@/lib/types";
 
 // ── 字段元数据 ────────────────────────────────────────────────────────────────
 
@@ -18,6 +19,15 @@ export const FIELD_LABELS: Record<string, string> = {
 
 // 内容为多行条目的字段，做行级别 diff
 export const LIST_FIELDS = new Set(["ip_range", "domain", "url"]);
+
+// 「合并两端」能并集的列表字段（自定义应用 ip_range/domain、URL 库 url/keyword）。
+// 合并只并这些字段——若两端差异不含其一（如仅启用状态/描述不同），合并帮不上，故不显示按钮。
+const MERGEABLE_FIELDS = new Set(["ip_range", "domain", "url", "keyword"]);
+
+/** 差异里是否有可合并的列表字段（决定是否显示「合并两端」）。 */
+export function hasMergeableDiff(diffs: FieldDiff[]): boolean {
+  return diffs.some((d) => MERGEABLE_FIELDS.has(d.field));
+}
 // 高优先级「主体」字段：功能配置（方向/协议/端口/IP/域名，及 URL 库的 URL 列表），差异突出显示。
 // 其余字段（描述/状态/应用类型/应用名/协议号/关键字…）的差异也显示，但弱化、不抢主体。
 export const HIGH_PRIORITY = new Set([

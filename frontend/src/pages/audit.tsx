@@ -27,24 +27,39 @@ function safeParse(text: string) {
   }
 }
 
+type BatchSnapItem = { name: string; action: string; data?: Record<string, unknown>; note?: string };
+
 /**
- * 审计「变更前/后」的一侧渲染：同步单对象时后端存的是带类型标签的规范化快照
- * （`{kind:"snapshot", object_type, data}`）——用对比页同款 SnapshotView 渲染成可读内容
- * （策略规则/引用、端口/代理控制，URL 列表，自定义应用 IP/域名）；其余（批量分组摘要、
- * 删除原始详情、旧记录报文等）回退到 JsonView 树。
+ * 审计「变更前/后」的一侧渲染，据后端存的标签选渲染方式：
+ * - `{kind:"snapshot", object_type, data}`：单对象同步的规范化快照——用对比页同款 SnapshotView
+ *   渲染成可读内容（策略规则/引用、端口/代理控制，URL 列表，自定义应用 IP/域名）。
+ * - `{kind:"snapshots", object_type, items:[{name,action,data,note}]}`：小批量同步，逐条渲染
+ *   「对象名 + 动作 + 说明」表头，有 data 的再附 SnapshotView。
+ * - 其余（大批量分组名单摘要、删除原始详情、旧记录报文等）：回退 JsonView 树。
  */
 function AuditSide({ raw }: { raw: string }) {
-  const parsed = safeParse(raw);
-  if (
-    parsed &&
-    typeof parsed === "object" &&
-    (parsed as any).kind === "snapshot" &&
-    (parsed as any).data
-  ) {
-    const snap = parsed as { object_type: ObjectType; data: Record<string, unknown> };
+  const parsed = safeParse(raw) as any;
+  if (parsed && typeof parsed === "object" && parsed.kind === "snapshot" && parsed.data) {
     return (
       <div className="rounded-md border border-border/50 p-2.5">
-        <SnapshotView data={snap.data} objectType={snap.object_type} />
+        <SnapshotView data={parsed.data} objectType={parsed.object_type as ObjectType} />
+      </div>
+    );
+  }
+  if (parsed && typeof parsed === "object" && parsed.kind === "snapshots" && Array.isArray(parsed.items)) {
+    const objectType = parsed.object_type as ObjectType;
+    return (
+      <div className="space-y-2">
+        {(parsed.items as BatchSnapItem[]).map((it, i) => (
+          <div key={i} className="rounded-md border border-border/50 p-2.5 space-y-1.5">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-medium break-all">{it.name}</span>
+              <Badge variant="secondary" className="h-4 px-1 text-[10px]">{it.action}</Badge>
+              {it.note && <span className="text-muted-foreground">{it.note}</span>}
+            </div>
+            {it.data && <SnapshotView data={it.data} objectType={objectType} />}
+          </div>
+        ))}
       </div>
     );
   }

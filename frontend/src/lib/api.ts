@@ -17,6 +17,7 @@ import type {
   PolicyDetail,
   BatchCompareResult,
   BatchSyncResult,
+  MergeResult,
   PolicyList,
   PolicyUsageResult,
   SearchResult,
@@ -219,6 +220,14 @@ export const syncApi = {
     force?: boolean;
     object_names?: string[];
   }) => http.post<BatchCompareResult>("/sync/compare", body, { timeout: 300000 }).then((r) => r.data),
+  // 合并（并集）：把某自定义应用 / URL 库在多个实例上的列表内容求并集，写回所有参与实例，
+  // 两端从此一致、谁的新增都不丢。自定义应用遇模式/标量字段两端不同返回冲突（不写）。默认 dry-run。
+  merge: (body: {
+    object_type: "customrule" | "url";
+    object_name: string;
+    instance_ids: number[];
+    dry_run: boolean;
+  }) => http.post<MergeResult>("/sync/merge", body, { timeout: 300000 }).then((r) => r.data),
 };
 
 // ---- 全局搜索 ----

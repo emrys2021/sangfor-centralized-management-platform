@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { PageHeader, Spinner } from "@/components/common";
 import { TargetCard } from "@/components/sync/object-diff";
 import { ApplyResultCard, BatchResultCard, CompareResultCard } from "@/components/sync/result-cards";
-import { SourceSummary } from "@/components/sync/snapshot";
+import { SnapshotView, SourceSummary } from "@/components/sync/snapshot";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,10 +22,12 @@ import {
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip } from "@/components/ui/tooltip";
 import { customRuleApi, instanceApi, policyApi, syncApi, urlApi } from "@/lib/api";
 import type {
   BatchCompareResult,
   BatchSyncResult,
+  MergeResult,
   ObjectType,
   SyncApplyResult,
   SyncDiffResult,
@@ -98,6 +100,9 @@ export function SyncPage() {
     { instanceId: number; instanceName: string; kind: "push" | "delete"; names: string[] } | null
   >(null);
   const [stagedResult, setStagedResult] = useState<BatchSyncResult | null>(null);
+  // 合并两端：某个「不一致」的自定义应用/URL 库，求源与该目标的并集写回两端
+  const [merge, setMerge] = useState<{ name: string; instanceId: number; instanceName: string } | null>(null);
+  const [mergeResult, setMergeResult] = useState<MergeResult | null>(null);
 
   const sourceName = instances.find((i) => i.id === sourceId)?.name ?? "源";
   const isPolicy = objectType === "policy";
@@ -253,6 +258,31 @@ export function SyncPage() {
     onError: (e: any) => toast.error(e?.response?.data?.detail ?? "操作失败"),
   });
 
+  // 合并两端：求源与该目标的并集，写回两端。仅自定义应用/URL；策略不支持。
+  const mergeMut = useMutation({
+    mutationFn: ({ dryRun }: { dryRun: boolean }) =>
+      syncApi.merge({
+        object_type: objectType as "customrule" | "url",
+        object_name: merge!.name,
+        instance_ids: [sourceId!, merge!.instanceId],
+        dry_run: dryRun,
+      }),
+    onSuccess: (r, vars) => {
+      setMergeResult(r);
+      if (vars.dryRun) {
+        if (r.conflict) toast.warning(`存在冲突字段（${r.conflict_fields.join("、")}），无法合并`);
+        else toast.success("已生成合并预览（并集）");
+      } else {
+        for (const tg of r.targets) if (tg.ok) invalidateTargetInstanceQueries(qc, tg.instance_id);
+        setResultKey(null); // 两端已变更，对比结果整体标记过期，提示重新对比核对
+        const failed = r.targets.filter((tg) => !tg.ok).length;
+        if (failed === 0) toast.success("已合并两端的列表内容为并集");
+        else toast.warning(`合并完成，${failed} 端失败`);
+      }
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.detail ?? "合并失败"),
+  });
+
   function toggleTarget(id: number) {
     setTargets((t) => (t.includes(id) ? t.filter((x) => x !== id) : [...t, id]));
   }
@@ -373,38 +403,41 @@ export function SyncPage() {
               <div className="flex flex-wrap gap-2">
                 {isBatch ? (
                   <>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => compareMut.mutate({ namesOnly: true })}
-                      disabled={!ready || targets.length === 0 || comparing}
-                      title="只比对象名单：仅源有 / 仅目标有 / 两边都有（不拉详情，秒级）"
-                    >
-                      {comparing && compareMut.variables?.namesOnly === true ? <Spinner /> : <Scale className="h-4 w-4" />}
-                      只对比名称
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => compareMut.mutate({ namesOnly: false })}
-                      disabled={!ready || targets.length === 0 || comparing}
-                      title="比名单 + 内容：仅源有 / 仅目标有 / 一致 / 不一致（逐对象拉详情，较慢）"
-                    >
-                      {comparing && compareMut.variables?.namesOnly === false ? <Spinner /> : <GitCompareArrows className="h-4 w-4" />}
-                      对比名称和内容
-                    </Button>
+                    <Tooltip content="只比对象名单：仅源有 / 仅目标有 / 两边都有（不拉详情，秒级）">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => compareMut.mutate({ namesOnly: true })}
+                        disabled={!ready || targets.length === 0 || comparing}
+                      >
+                        {comparing && compareMut.variables?.namesOnly === true ? <Spinner /> : <Scale className="h-4 w-4" />}
+                        只对比名称
+                      </Button>
+                    </Tooltip>
+                    <Tooltip content="比名单 + 内容：仅源有 / 仅目标有 / 一致 / 不一致（逐对象拉详情，较慢）">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => compareMut.mutate({ namesOnly: false })}
+                        disabled={!ready || targets.length === 0 || comparing}
+                      >
+                        {comparing && compareMut.variables?.namesOnly === false ? <Spinner /> : <GitCompareArrows className="h-4 w-4" />}
+                        对比名称和内容
+                      </Button>
+                    </Tooltip>
                   </>
                 ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => diffMut.mutate()}
-                    disabled={!ready || targets.length === 0 || comparing}
-                    title="比源与目标该对象的字段级差异，不写设备"
-                  >
-                    {comparing ? <Spinner /> : <Scale className="h-4 w-4" />}
-                    对比
-                  </Button>
+                  <Tooltip content="比源与目标该对象的字段级差异，不写设备">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => diffMut.mutate()}
+                      disabled={!ready || targets.length === 0 || comparing}
+                    >
+                      {comparing ? <Spinner /> : <Scale className="h-4 w-4" />}
+                      对比
+                    </Button>
+                  </Tooltip>
                 )}
               </div>
               <p className="text-[11px] text-muted-foreground/60">
@@ -503,13 +536,15 @@ export function SyncPage() {
                           ? "只对比名称（仅比对象名单，未拉内容）"
                           : "对比名称和内容（逐对象，只读不写设备）"}
                         {!compareResult.names_only && compareResult.source_cached && (
-                          <span className="text-amber-500/80" title="源快照来自缓存；写操作后或缓存过期会自动重取">
-                            {" "}· 源快照缓存{
-                              compareResult.source_cache_age_seconds < 60
-                                ? "刚刚"
-                                : `${Math.floor(compareResult.source_cache_age_seconds / 60)}分钟前`
-                            }
-                          </span>
+                          <Tooltip content="源快照来自缓存；写操作后或缓存过期会自动重取">
+                            <span className="text-amber-500/80">
+                              {" "}· 源快照缓存{
+                                compareResult.source_cache_age_seconds < 60
+                                  ? "刚刚"
+                                  : `${Math.floor(compareResult.source_cache_age_seconds / 60)}分钟前`
+                              }
+                            </span>
+                          </Tooltip>
                         )}
                       </div>
                       <p className="text-[11px] text-muted-foreground/60">
@@ -527,6 +562,14 @@ export function SyncPage() {
                           }
                           onDelete={(instanceId, instanceName, names) =>
                             { setStagedResult(null); setStaged({ instanceId, instanceName, kind: "delete", names }); }
+                          }
+                          onMerge={
+                            !compareResult.names_only && objectType !== "policy"
+                              ? (instanceId, instanceName, name) => {
+                                  setMergeResult(null);
+                                  setMerge({ name, instanceId, instanceName });
+                                }
+                              : undefined
                           }
                         />
                       ))}
@@ -546,6 +589,14 @@ export function SyncPage() {
                         src={diff.source_snapshot as Record<string, unknown>}
                         objectType={objectType}
                         sourceName={sourceName}
+                        onMerge={
+                          objectType !== "policy"
+                            ? (instanceId, instanceName) => {
+                                setMergeResult(null);
+                                setMerge({ name: singleObjectName, instanceId, instanceName });
+                              }
+                            : undefined
+                        }
                       />
                     ))}
                   </>
@@ -726,6 +777,117 @@ export function SyncPage() {
                       {stagedMut.isPending ? <Spinner /> : staged.kind === "delete" ? <Trash2 className="h-4 w-4" /> : <ArrowRight className="h-4 w-4" />}
                       {staged.kind === "delete" ? "确认删除" : "确认写入"}
                     </Button>
+                  </>
+                )}
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* 合并两端（并集）：某个「不一致」的自定义应用/URL 库，求源与该目标的并集写回两端 */}
+      <Dialog open={merge != null} onOpenChange={(v) => !v && (setMerge(null), setMergeResult(null))}>
+        <DialogContent className="max-w-2xl">
+          {merge && (
+            <>
+              <DialogHeader>
+                <DialogTitle>合并两端（并集）</DialogTitle>
+                <DialogDescription>
+                  把「{merge.name}」在源「{sourceName}」与目标「{merge.instanceName}」上的列表内容（IP/URL/域名/关键词）求
+                  <span className="font-medium text-foreground/80">并集</span>，写回<span className="font-medium text-foreground/80">两端</span>——
+                  两端的<span className="font-medium text-foreground/80">列表内容</span>从此一致、谁的新增都不丢；
+                  <span className="text-foreground/70">启用状态、描述等各端保持不变。</span>请先「仅预览」核对并集内容。
+                </DialogDescription>
+              </DialogHeader>
+
+              {mergeResult?.conflict ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-xs text-amber-300/90">
+                  两端存在<span className="font-medium">冲突字段</span>（{mergeResult.conflict_fields.join("、")}）——
+                  这些是协议/端口/方向等模式字段，无法并集。请先手动改成一致，再合并；本次<span className="font-medium">未写入任何一端</span>。
+                </div>
+              ) : mergeResult ? (
+                mergeResult.dry_run ? (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                      <span>并集预览（将写回两端）：</span>
+                      <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-full bg-emerald-500" />源独有</span>
+                      <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-full bg-sky-500" />目标独有</span>
+                      <span className="inline-flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-full bg-muted-foreground/40" />两端共有</span>
+                    </div>
+                    <div className="max-h-[50vh] space-y-2 overflow-auto rounded-md border border-border/50 p-2.5">
+                      {mergeResult.preview_fields.length === 0 ? (
+                        mergeResult.merged_snapshot && (
+                          <SnapshotView data={mergeResult.merged_snapshot} objectType={objectType} />
+                        )
+                      ) : (
+                        mergeResult.preview_fields.map((f) => (
+                          <div key={f.field} className="space-y-1">
+                            <div className="text-xs font-medium text-muted-foreground/70">
+                              {f.label}
+                              <span className="text-muted-foreground/40">
+                                （{f.both.length + f.only_source.length + f.only_target.length}）
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap gap-1.5 text-xs">
+                              {f.only_source.map((e) => (
+                                <span key={`s-${e}`} className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-300/90 break-all">
+                                  {e}
+                                </span>
+                              ))}
+                              {f.only_target.map((e) => (
+                                <span key={`t-${e}`} className="rounded border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-sky-300/90 break-all">
+                                  {e}
+                                </span>
+                              ))}
+                              {f.both.map((e) => (
+                                <span key={`b-${e}`} className="rounded border border-border/50 px-1.5 py-0.5 text-muted-foreground/70 break-all">
+                                  {e}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-1.5 text-sm">
+                    {mergeResult.targets.map((tg) => (
+                      <div key={tg.instance_id} className="flex items-center justify-between rounded border px-3 py-1.5 text-xs">
+                        <span className="font-medium">{tg.instance_name}</span>
+                        <span className={tg.ok ? "text-emerald-400" : "text-red-400"}>{tg.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              ) : (
+                <div className="text-sm text-muted-foreground">点「仅预览」计算并展示并集内容，确认后再写回两端。</div>
+              )}
+
+              <DialogFooter className="gap-2">
+                {mergeResult && !mergeResult.dry_run ? (
+                  <Button variant="outline" onClick={() => { setMerge(null); setMergeResult(null); }}>
+                    关闭
+                  </Button>
+                ) : (
+                  <>
+                    <Button variant="outline" onClick={() => mergeMut.mutate({ dryRun: true })} disabled={mergeMut.isPending}>
+                      {mergeMut.isPending && mergeMut.variables?.dryRun === true && <Spinner />}
+                      仅预览（并集）
+                    </Button>
+                    <Tooltip align="end" content={mergeResult?.conflict ? "存在冲突字段，无法合并" : ""}>
+                      <Button
+                        onClick={() => mergeMut.mutate({ dryRun: false })}
+                        disabled={mergeMut.isPending || mergeResult?.conflict}
+                      >
+                        {mergeMut.isPending && mergeMut.variables?.dryRun === false ? (
+                          <Spinner />
+                        ) : (
+                          <GitCompareArrows className="h-4 w-4" />
+                        )}
+                        合并写回两端
+                      </Button>
+                    </Tooltip>
                   </>
                 )}
               </DialogFooter>

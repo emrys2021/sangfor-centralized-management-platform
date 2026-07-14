@@ -9,11 +9,13 @@ import {
   LIST_FIELDS,
   ListDiff,
   fmtScalar,
+  hasMergeableDiff,
   parseEntries,
 } from "@/components/sync/field-diff";
 import { PolicyDiff } from "@/components/sync/policy-diff";
 import { countPolicyDiffs } from "@/components/sync/policy-rules";
 import { Badge } from "@/components/ui/badge";
+import { Tooltip } from "@/components/ui/tooltip";
 import type { FieldDiff, ObjectType, SyncDiffResult } from "@/lib/types";
 
 // ── 对象内容差异主体（策略规则级 / 其他字段级），TargetCard 与全量对比复用 ─────────────
@@ -169,11 +171,14 @@ export function TargetCard({
   src,
   objectType,
   sourceName,
+  onMerge,
 }: {
   t: SyncDiffResult["targets"][number];
   src: Record<string, unknown>;
   objectType: ObjectType;
   sourceName: string;
+  // 「合并两端」回调（源 ↔ 该目标求并集写回两端）；仅对自定义应用/URL 传入。
+  onMerge?: (instanceId: number, instanceName: string) => void;
 }) {
   const targetMissing = !t.exists && !t.error;
 
@@ -182,6 +187,11 @@ export function TargetCard({
 
   // 策略：以规则级实际差异数为准（后端因 rule_id 跨实例不同会误标 changed，但内容可能一致）
   const reallyChanged = objectType === "policy" ? diffCount > 0 : t.changed;
+  // 合并两端：两端都有该对象、且差异含可合并列表字段的自定义应用/URL（策略不支持；仅启用状态/
+  // 描述不同=无列表差异时不显示，合并帮不上）。
+  const canMerge =
+    !!onMerge && !targetMissing && !t.error && reallyChanged && objectType !== "policy" &&
+    hasMergeableDiff(t.diffs);
   const badge = t.error ? (
     <Badge variant="destructive">读取错误</Badge>
   ) : targetMissing ? (
@@ -201,7 +211,23 @@ export function TargetCard({
           <span className="mx-1.5 text-muted-foreground/50">→</span>
           {t.instance_name}
         </span>
-        {badge}
+        <div className="flex items-center gap-2">
+          {canMerge && (
+            <Tooltip
+              align="end"
+              content="把源与该目标的列表内容（IP/URL/域名/关键词）求并集写回两端；启用状态、描述各端保持不变"
+            >
+              <button
+                type="button"
+                onClick={() => onMerge!(t.instance_id, t.instance_name)}
+                className="shrink-0 rounded border border-violet-500/40 px-1.5 py-0.5 text-[11px] text-violet-300/90 transition-colors hover:bg-violet-500/10"
+              >
+                合并两端
+              </button>
+            </Tooltip>
+          )}
+          {badge}
+        </div>
       </div>
 
       {t.error && <p className="text-xs text-destructive">{t.error}</p>}

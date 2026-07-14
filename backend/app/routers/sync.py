@@ -15,12 +15,14 @@ from app.schemas.sync import (
     BatchCompareResult,
     BatchSyncRequest,
     BatchSyncResult,
+    MergeRequest,
+    MergeResult,
     SyncApplyRequest,
     SyncApplyResult,
     SyncDiffRequest,
     SyncDiffResult,
 )
-from app.services import compare_service, sync_service
+from app.services import compare_service, merge_service, sync_service
 
 router = APIRouter(prefix="/api/sync", tags=["sync"])
 
@@ -81,6 +83,31 @@ def compare(req: BatchCompareRequest, db: Session = Depends(get_db)):
             names_only=req.names_only,
             force=req.force,
             object_names=req.object_names,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except SangforWebError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/merge", response_model=MergeResult)
+def merge_object(
+    req: MergeRequest,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(get_current_user),
+):
+    """把某自定义应用 / URL 库在多个实例上的内容**合并为并集**并写回所有参与实例。默认 dry-run。
+
+    自定义应用遇模式/标量字段两端不一致时返回冲突（不写入）。
+    """
+    try:
+        return merge_service.merge_object(
+            db,
+            user,
+            object_type=req.object_type,
+            object_name=req.object_name,
+            instance_ids=req.instance_ids,
+            dry_run=req.dry_run,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

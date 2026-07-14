@@ -152,12 +152,30 @@ def _build_snapshot(web: SangforWebClient, object_type: str, name: str) -> tuple
         return "error", {}, str(exc)
 
 
+# 自定义应用 / URL 库里内容为**换行分隔列表**的字段——语义是**集合**、顺序无意义（与访问权限
+# 策略的规则顺序不同，后者影响命中优先级）。对比这些字段按集合比，避免仅条目顺序不同就误判「不
+# 一致」。（这些字段名仅出现在 customrule/url 快照里，策略快照无同名字段，据字段名区分即安全。）
+_SET_FIELDS = frozenset({"url", "ip_range", "domain", "keyword"})
+
+
+def _entry_set(value) -> frozenset[str]:
+    """换行分隔文本 -> 去空、去首尾空白的条目集合（顺序 / 重复 / 空行不影响）。"""
+    return frozenset(s.strip() for s in str(value or "").replace("\r\n", "\n").split("\n") if s.strip())
+
+
+def _field_equal(field: str, s_val, t_val) -> bool:
+    """字段是否相等：列表字段按集合比（顺序无关），其余按值比。"""
+    if field in _SET_FIELDS:
+        return _entry_set(s_val) == _entry_set(t_val)
+    return s_val == t_val
+
+
 def _diff_snapshots(source: dict, target: dict) -> list[FieldDiff]:
     diffs: list[FieldDiff] = []
     for key in sorted(set(source) | set(target)):
         s_val = source.get(key)
         t_val = target.get(key)
-        if s_val != t_val:
+        if not _field_equal(key, s_val, t_val):
             diffs.append(FieldDiff(field=key, source=s_val, target=t_val))
     return diffs
 
@@ -495,6 +513,11 @@ def _content_snapshot(object_type: str, snapshot: dict | None) -> dict | None:
 # 批量逐对象动作 -> 审计摘要里的中文分组名
 _BATCH_ACTION_LABEL = {"create": "新增", "update": "覆盖", "delete": "删除", "skip": "跳过", "fail": "失败"}
 
+# 批量同步审计「变更后」逐对象带内容展示的对象数上限：小批量（如对比后勾选同步几条）逐条存
+# 规范化快照、前端用 SnapshotView 渲染；超过则退回「按动作分组的名单摘要」，避免记录过大、
+# 详情弹窗过长。源内容在写入时本就已读到，带内容几乎零额外开销。
+_BATCH_CONTENT_MAX = 20
+
 
 def _readable_batch_summary(
     details: list[BatchObjectResult], failed: list[BatchObjectResult]
@@ -510,6 +533,29 @@ def _readable_batch_summary(
         label = _BATCH_ACTION_LABEL.get(r.action, r.action)
         grouped.setdefault(label, []).append({"对象": r.name, "说明": r.message} if r.message else r.name)
     return grouped
+
+
+def _batch_after_content(
+    object_type: str,
+    synced_contents: list[dict],
+    details: list[BatchObjectResult],
+    failed: list[BatchObjectResult],
+) -> dict | None:
+    """批量同步审计「变更后」内容。
+
+    小批量（新增/覆盖对象数 ≤ :data:`_BATCH_CONTENT_MAX` 且有内容）→ 逐条带源内容快照
+    （``kind == "snapshots"``，前端用 SnapshotView 渲染），并附上跳过/失败项的说明（无内容）；
+    否则（大批量 / dry-run 无内容）→ 退回按动作分组的名单摘要（见 :func:`_readable_batch_summary`）。
+    """
+    if synced_contents and len(synced_contents) <= _BATCH_CONTENT_MAX:
+        # 跳过/失败项只带说明、无内容，附在后面以免遗漏（删除项的内容在「变更前」）
+        notes = [
+            {"name": r.name, "action": _BATCH_ACTION_LABEL.get(r.action, r.action), "note": r.message}
+            for r in [*details, *failed]
+            if r.action in ("skip", "fail")
+        ]
+        return {"kind": "snapshots", "object_type": object_type, "items": [*synced_contents, *notes]}
+    return _readable_batch_summary(details, failed) or None
 
 
 def batch_sync(
@@ -627,6 +673,7 @@ def batch_sync(
         updated: list[str] = []
         deleted: list[str] = []
         deleted_snapshots: list[dict] = []  # 被删对象的删前内容，进审计「变更前」供核对/重建
+        synced_contents: list[dict] = []  # 新增/覆盖对象的源内容（规范化快照），小批量时进审计富展示
         failed: list[BatchObjectResult] = [
             BatchObjectResult(
                 name=n, action="fail", ok=False,
@@ -673,10 +720,16 @@ def batch_sync(
                     invalidate_instance(tid)  # 真实写入后失效目标分析缓存
                     (updated if exists else created).append(name)
                     miss = len(outcome.get("missing") or [])
+                    note = f"降级：跳过 {miss} 个引用（与源不等价）" if outcome.get("degraded") else ""
                     details.append(BatchObjectResult(
-                        name=name, action="update" if exists else "create", ok=True,
-                        message=f"降级：跳过 {miss} 个引用（与源不等价）" if outcome.get("degraded") else "",
+                        name=name, action="update" if exists else "create", ok=True, message=note,
                     ))
+                    # 抓取本次同步的源内容（规范化快照）供小批量审计富展示；策略把已读的 detail
+                    # 规范化，url/customrule 直接用上面 _build_snapshot 得到的 snap，均无额外设备请求。
+                    content = build_policy_snapshot(name, detail) if object_type == "policy" else snap
+                    synced_contents.append(
+                        {"name": name, "action": "覆盖" if exists else "新增", "data": content, "note": note}
+                    )
             except Exception as exc:  # noqa: BLE001  单对象失败不拖垮整体
                 failed.append(BatchObjectResult(name=name, action="fail", ok=False, message=str(exc)))
 
@@ -791,10 +844,11 @@ def batch_sync(
             + f"（新增 {len(created)}/覆盖 {len(updated)}/删除 {len(deleted)}/失败 {len(failed)}）"
             + ("（dry-run）" if dry_run else "")
             + ("（镜像）" if mirror else "（含删除）" if delete_names else ""),
-            # 变更前：被删对象的删前内容（可核对/重建）；变更后：按动作分组的可读摘要
-            # （新增/覆盖/删除/跳过/失败 + 对象名与原因），比原始报文直观。
+            # 变更前：被删对象的删前内容（可核对/重建）。
+            # 变更后：小批量（新增/覆盖 ≤ _BATCH_CONTENT_MAX）逐条带源内容快照，前端用 SnapshotView
+            # 渲染成可读内容；大批量退回「按动作分组的名单摘要」，避免记录过大、弹窗过长。
             before={"删除的对象": deleted_snapshots} if deleted_snapshots else None,
-            after=_readable_batch_summary(details, failed) or None,
+            after=_batch_after_content(object_type, synced_contents, details, failed),
         )
 
     return BatchSyncResult(

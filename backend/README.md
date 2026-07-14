@@ -27,7 +27,7 @@ app/
     web_client.py    Web/CGI 客户端（功能 1-3 读 + 写占位，含 dry-run 安全闸）
     api_client.py    官方 API 客户端
     session_pool.py  按实例缓存已登录会话
-  services/          customrule / url / policy / sync / instance 业务逻辑
+  services/          customrule / url / policy / sync / compare / merge / instance 业务逻辑
   routers/           各功能 REST 路由
 ```
 
@@ -45,5 +45,6 @@ app/
 - `/api/instances/{id}/customrules` — 功能 1（list/detail/写）。
 - `/api/instances/{id}/urls` — 功能 2。
 - `/api/instances/{id}/policies` — 功能 3。
-- `POST /api/sync/diff`、`POST /api/sync/apply` — 功能 5。
+- `POST /api/sync/diff`、`POST /api/sync/apply`、`POST /api/sync/batch`、`POST /api/sync/compare` — 功能 5（对比 / 同步）。
+- `POST /api/sync/merge` — 自定义应用 / URL 库跨实例「合并（并集）」，写回所有参与实例（见 `services/merge_service.py`）。
 - `GET /api/audit-logs` — 审计查询。
