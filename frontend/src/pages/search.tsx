@@ -283,20 +283,27 @@ export function SearchPage() {
               {i.name}
             </Badge>
           ))}
-          <button
-            type="button"
-            className="text-xs text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
+          {/* 分隔线 + ghost 按钮：与上面「可勾选的实例徽章」区分开——这两个是批量设置范围的
+              **操作**，不是可选项，避免看起来像样式不统一的第 5、6 个实例。 */}
+          <span className="mx-0.5 h-4 w-px shrink-0 bg-border" />
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-2 text-xs text-muted-foreground hover:text-foreground"
             onClick={() => setScope(enabled.map((i) => i.id))}
+            disabled={enabled.length > 0 && scope.length === enabled.length}
           >
             全部实例
-          </button>
-          <button
-            type="button"
-            className="text-xs text-muted-foreground/70 underline-offset-2 hover:text-foreground hover:underline"
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-2 text-xs text-muted-foreground hover:text-foreground"
             onClick={() => setScope(instanceId != null ? [instanceId] : [])}
+            disabled={instanceId != null && scope.length === 1 && scope[0] === instanceId}
           >
             仅当前
-          </button>
+          </Button>
           {multi && (
             <span className="text-[11px] text-muted-foreground/60">
               多实例并行检索，各自独立返回；未建索引的实例首次较慢。
