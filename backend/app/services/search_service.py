@@ -1,9 +1,11 @@
 #! /usr/bin/env python3
 # coding=utf-8
-"""全局搜索：按域名 / IP 反查引用它的自定义应用、自定义 URL 库与内置 URL 库。
+"""全局搜索：按域名 / IP 反查引用它的对象，或按名称查对象。
 
 设备侧没有「按域名/IP 反查」接口，这里把各对象的可匹配条目汇总成一份**索引**，再在内存里做
-智能匹配：
+两类匹配（同一个查询同时跑，结果分区返回）：
+
+**一、按内容**（智能匹配）
 
 - 索引内容：每个自定义应用的 IP 范围 + 域名；每个 URL 库（自定义 / 内置）的 URL/IP/域名条目。
 - 智能匹配（与单纯子串不同）：
@@ -12,6 +14,12 @@
     这类误命中）。
   - IP：理解单 IP / CIDR 网段 / ``a-b`` 范围的**区间重叠**——查询某 IP 命中包含它的网段条目，
     反之查询网段也命中其中的 IP 条目。
+
+**二、按名称**（子串匹配，见 :func:`name_match`）
+
+- 覆盖自定义应用 / URL 库 / **访问权限策略**的名称——用户常记得的是「钉钉白名单」这类名字。
+- 策略**只**参与名称匹配：其内容是对应用/URL 的引用而非 IP/域名条目，不纳入内容索引；
+  故只需一次 list、无须逐条拉详情。
 
 构建索引需逐个 listItem（应用详情、各 URL 库内容），开销大，故按实例做 TTL 缓存
 （:data:`app.services.analysis_cache.search_cache`），写操作后随分析缓存一并失效；
@@ -115,11 +123,25 @@ def _match_tokens(query: str, tokens: list[str], query_is_ip: bool) -> list[str]
     return out
 
 
+def name_match(name: str, query: str) -> bool:
+    """对象**名称**匹配：忽略大小写与首尾空白的子串包含。
+
+    与按内容（IP/域名）的智能匹配互补——用户常记得的是「钉钉白名单」这类名字而非具体条目。
+    名称是自由文本（中英文混排），不做域名/IP 的语义解析，子串包含最贴合直觉。
+    """
+    n, q = (name or "").strip().lower(), (query or "").strip().lower()
+    return bool(n and q and q in n)
+
+
 # --------------------------------------------------------------------------- #
 # 索引构建（带 TTL 缓存）
 # --------------------------------------------------------------------------- #
 def _build_index(instance: Instance) -> dict:
-    """汇总该实例所有自定义应用与 URL 库的可匹配条目（并发拉取）。"""
+    """汇总该实例所有自定义应用与 URL 库的可匹配条目（并发拉取），外加各对象名称。
+
+    名称索引额外含**访问权限策略**：策略只按名称参与搜索（其内容是对应用/URL 的引用，
+    不是 IP/域名条目），故只需一次 list、无须逐条拉详情，开销可忽略。
+    """
     web = session_pool.get_web_client(instance)
     web.login()  # 并发前先登录，避免多线程同时登录
 
@@ -139,6 +161,15 @@ def _build_index(instance: Instance) -> dict:
 
     errors: list[str] = []
 
+    # 策略：只取名单（名称 + 描述）供名称搜索；读失败不影响其余索引
+    policies_idx: list[dict] = []
+    try:
+        for p in web.list_policies().get("access_policies", []) or []:
+            if p.get("name"):
+                policies_idx.append({"name": str(p["name"]), "depict": str(p.get("depict") or "")})
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"访问权限策略名单: {exc}")
+
     def fetch(item: tuple[str, dict]):
         kind, payload = item
         client = _worker_tls.client
@@ -148,10 +179,16 @@ def _build_index(instance: Instance) -> dict:
                 detail = client.get_custom_rule_detail(name, summary=payload)
                 form = customrule_form.parse_form(detail.get("summary", {}), detail.get("detail", {}))
                 domains = [d.strip() for d in (form.get("domain") or "").splitlines() if d.strip()]
-                return ("app", {"name": name, "ips": detail.get("ip_list", []) or [], "domains": domains}, None)
+                return ("app", {
+                    "name": name, "depict": str(payload.get("depict") or ""),
+                    "ips": detail.get("ip_list", []) or [], "domains": domains,
+                }, None)
             name = payload["name"]
             entries = client.get_url_group_content(name)
-            return ("url", {"name": name, "inside": bool(payload.get("inside")), "entries": entries}, None)
+            return ("url", {
+                "name": name, "depict": str(payload.get("depict") or ""),
+                "inside": bool(payload.get("inside")), "entries": entries,
+            }, None)
         except Exception as exc:  # noqa: BLE001  单对象失败不拖垮整体
             label = payload.get("rulename") or payload.get("name")
             return (kind, None, f"{label}: {exc}")
@@ -170,11 +207,15 @@ def _build_index(instance: Instance) -> dict:
                 else:
                     urls_idx.append(data)
 
-    return {"apps": apps_idx, "urls": urls_idx, "errors": errors}
+    return {"apps": apps_idx, "urls": urls_idx, "policies": policies_idx, "errors": errors}
 
 
 def search(instance: Instance, query: str, *, force: bool = False) -> dict:
-    """在该实例的索引上按域名 / IP 智能匹配，返回分组命中结果。
+    """在该实例的索引上做两类匹配，返回分组命中结果。
+
+    - **按内容**：域名 / IP 智能匹配自定义应用的 IP·域名、各 URL 库的条目（见模块 docstring）。
+    - **按名称**：对象名的子串匹配，覆盖自定义应用 / URL 库 / **访问权限策略**——用户常记得的是
+      「钉钉白名单」这类名字而非具体条目。两类结果同时返回，前端分区展示。
 
     返回额外带 ``cached`` / ``cache_age_seconds`` 供前端展示「索引 · N 分钟前」。
     """
@@ -187,17 +228,30 @@ def search(instance: Instance, query: str, *, force: bool = False) -> dict:
     apps: list[dict] = []
     custom_urls: list[dict] = []
     builtin_urls: list[dict] = []
+    name_hits: list[dict] = []
     if q:
         for app in index["apps"]:
             tokens = app["ips"] if query_is_ip else app["domains"]
             matches = _match_tokens(q, tokens, query_is_ip)
             if matches:
                 apps.append({"name": app["name"], "matches": matches})
+            if name_match(app["name"], q):
+                name_hits.append({
+                    "kind": "customrule", "name": app["name"], "depict": app.get("depict", ""),
+                })
         for u in index["urls"]:
             matches = _match_tokens(q, u["entries"], query_is_ip)
             if matches:
                 hit = {"name": u["name"], "matches": matches}
                 (builtin_urls if u["inside"] else custom_urls).append(hit)
+            if name_match(u["name"], q):
+                name_hits.append({
+                    "kind": "url", "name": u["name"], "depict": u.get("depict", ""),
+                    "builtin": bool(u["inside"]),
+                })
+        for p in index.get("policies", []):
+            if name_match(p["name"], q):
+                name_hits.append({"kind": "policy", "name": p["name"], "depict": p.get("depict", "")})
 
     return {
         "query": q,
@@ -205,9 +259,11 @@ def search(instance: Instance, query: str, *, force: bool = False) -> dict:
         "apps": apps,
         "custom_urls": custom_urls,
         "builtin_urls": builtin_urls,
-        "total_hits": len(apps) + len(custom_urls) + len(builtin_urls),
+        "name_hits": name_hits,
+        "total_hits": len(apps) + len(custom_urls) + len(builtin_urls) + len(name_hits),
         "indexed_apps": len(index["apps"]),
         "indexed_url_groups": len(index["urls"]),
+        "indexed_policies": len(index.get("policies", [])),
         "errors": index["errors"],
         "cached": cached,
         "cache_age_seconds": age,

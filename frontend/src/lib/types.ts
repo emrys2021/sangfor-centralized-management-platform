@@ -402,15 +402,25 @@ export interface SearchHit {
   matches: string[];
 }
 
+/** 按对象**名称**命中（子串匹配），与按配置内容命中互补。 */
+export interface SearchNameHit {
+  kind: "customrule" | "url" | "policy";
+  name: string;
+  depict: string;
+  builtin: boolean; // 仅 kind=url 有意义：是否内置 URL 库
+}
+
 export interface SearchResult {
   query: string;
   query_type: "ip" | "domain";
   apps: SearchHit[];
   custom_urls: SearchHit[];
   builtin_urls: SearchHit[];
+  name_hits: SearchNameHit[];
   total_hits: number;
   indexed_apps: number;
   indexed_url_groups: number;
+  indexed_policies: number;
   errors: string[];
   cached: boolean;
   cache_age_seconds: number;

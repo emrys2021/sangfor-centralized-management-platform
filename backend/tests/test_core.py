@@ -2486,3 +2486,51 @@ def test_diff_snapshots_list_fields_order_insensitive():
     assert [d.field for d in _diff_snapshots({"url": "a\nb"}, {"url": "a"})] == ["url"]
     # 非列表字段仍按值比（如启用状态）
     assert [d.field for d in _diff_snapshots({"status": True}, {"status": False})] == ["status"]
+
+
+def test_search_name_match_substring_case_insensitive():
+    """名称匹配：忽略大小写与首尾空白的子串包含；空串不匹配。"""
+    from app.services.search_service import name_match
+
+    assert name_match("钉钉白名单", "钉钉")
+    assert name_match("GitHub白名单", "github")  # 忽略大小写
+    assert name_match("GitHub白名单", " GitHub ")  # 忽略首尾空白
+    assert not name_match("钉钉白名单", "微信")
+    assert not name_match("", "钉钉") and not name_match("钉钉白名单", "")
+
+
+def test_search_returns_name_hits_incl_policies():
+    """search() 同时返回按名称命中：覆盖自定义应用 / URL 库 / 访问权限策略。"""
+    from app.services import search_service
+
+    index = {
+        "apps": [{"name": "钉钉应用", "depict": "IM", "ips": ["1.1.1.1"], "domains": []}],
+        "urls": [
+            {"name": "钉钉白名单", "depict": "", "inside": False, "entries": ["dingtalk.com"]},
+            {"name": "IT相关", "depict": "", "inside": True, "entries": []},
+        ],
+        "policies": [{"name": "允许钉钉", "depict": "放行钉钉"}, {"name": "禁止微信", "depict": ""}],
+        "errors": [],
+    }
+    search_service.search_cache.invalidate(9998)
+    search_service.search_cache._store[9998] = (__import__("time").monotonic(), index)
+
+    class _Inst:
+        id = 9998
+
+    r = search_service.search(_Inst(), "钉钉")
+    by_kind = {}
+    for h in r["name_hits"]:
+        by_kind.setdefault(h["kind"], []).append(h["name"])
+    assert by_kind["customrule"] == ["钉钉应用"]
+    assert by_kind["url"] == ["钉钉白名单"]
+    assert by_kind["policy"] == ["允许钉钉"]  # 策略只按名称参与
+    assert r["indexed_policies"] == 2
+    # 名称命中计入总数；「禁止微信」不该出现
+    assert r["total_hits"] == len(r["name_hits"])
+    assert all("微信" not in n for names in by_kind.values() for n in names)
+
+    # 内容命中与名称命中互补：查域名只命中内容，不产生名称命中
+    r2 = search_service.search(_Inst(), "dingtalk.com")
+    assert [h["name"] for h in r2["custom_urls"]] == ["钉钉白名单"]
+    assert r2["name_hits"] == []
